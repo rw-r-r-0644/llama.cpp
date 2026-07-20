@@ -6,6 +6,9 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
+#include <condition_variable>
+#include <deque>
 #include <optional>
 #include <string>
 #include <vector>
@@ -227,6 +230,278 @@ struct ggml_backend_rpc_buffer_context {
     uint64_t remote_ptr;
 };
 
+// Async RPC support
+// The RPC transport is a single ordered request/response stream per endpoint.
+// To enable pipeline parallelism, the client backend must expose async ops and
+// events.
+//
+// Every command goes through a per-socket ordered send queue. Slots are
+// assigned sequence numbers in append order and are written to the socket
+// strictly in that order. Because the server processes commands in order and
+// sends responses in order, draining responses up to a given sequence number
+// provides a happens-before guarantee for all earlier commands.
+//
+// Slots can be reserved before their payload is known ("placeholders"): this
+// lets cross-backend tensor copies reserve the destination SET_TENSOR slot
+// ahead of any subsequent GRAPH_COMPUTE, while a background forwarder thread
+// fetches the data and fills the slot in later (see rpc_fwd_request).
+//
+// No mutex is ever held while blocking on socket I/O: a single flusher and a
+// single drainer per socket are selected via flags, so a blocked read cannot
+// deadlock a concurrent write (and vice versa).
+
+struct rpc_async_op {
+    enum rpc_cmd cmd;
+    // For GET_TENSOR: destination buffer to fill when the response is drained.
+    void * get_data = nullptr;
+    size_t get_size = 0;
+    // For other response-bearing ops: optional destination for the response payload.
+    void * out_data = nullptr;
+    size_t out_size = 0;
+    // Response payload when out_data is not set (discarded after draining).
+    std::vector<uint8_t> response;
+};
+
+// one slot in the ordered send queue of a socket
+struct rpc_send_item {
+    // | cmd (1 byte) | input_size (8 bytes) | fixed payload |
+    std::vector<uint8_t> bytes;
+    // additional payload written after bytes (owned by the item)
+    std::vector<uint8_t> owned;
+};
+
+struct rpc_async_state {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t next_send_seq = 1;
+    uint64_t next_recv_seq = 1;
+    // response-bearing ops, in send order
+    std::deque<std::pair<uint64_t, rpc_async_op>> pending;
+    // ordered send queue
+    std::deque<std::shared_ptr<rpc_send_item>> sendq;
+    // a thread is currently writing queued items to the socket
+    bool flushing = false;
+    // a thread is currently reading a response from the socket
+    bool draining = false;
+};
+
+// NOTE: intentionally leaked (never destroyed at exit): detached threads may
+// still be using the async states while the process tears down static objects.
+static std::mutex & g_rpc_async_mutex = *new std::mutex;
+static std::unordered_map<socket_t *, std::shared_ptr<rpc_async_state>> & g_rpc_async_states =
+    *new std::unordered_map<socket_t *, std::shared_ptr<rpc_async_state>>;
+
+// Set GGML_RPC_DISABLE_ASYNC=1 to force the legacy synchronous behaviour.
+// Useful for A/B benchmarking without recompiling.
+static bool rpc_async_enabled() {
+    static const bool enabled = std::getenv("GGML_RPC_DISABLE_ASYNC") == nullptr;
+    return enabled;
+}
+
+static std::shared_ptr<rpc_async_state> rpc_get_async_state(const socket_ptr & sock) {
+    std::lock_guard<std::mutex> lock(g_rpc_async_mutex);
+    auto it = g_rpc_async_states.find(sock.get());
+    if (it != g_rpc_async_states.end()) {
+        return it->second;
+    }
+    auto state = std::make_shared<rpc_async_state>();
+    g_rpc_async_states[sock.get()] = state;
+    return state;
+}
+
+// True if the command has a response that must be read by the client.
+static bool rpc_cmd_has_response(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:
+        case RPC_CMD_GET_ALIGNMENT:
+        case RPC_CMD_GET_MAX_SIZE:
+        case RPC_CMD_BUFFER_GET_BASE:
+        case RPC_CMD_FREE_BUFFER:
+        case RPC_CMD_BUFFER_CLEAR:
+        case RPC_CMD_SET_TENSOR_HASH:
+        case RPC_CMD_INIT_TENSOR:
+        case RPC_CMD_GET_TENSOR:
+        case RPC_CMD_COPY_TENSOR:
+        case RPC_CMD_GET_DEVICE_MEMORY:
+        case RPC_CMD_GET_ALLOC_SIZE:
+        case RPC_CMD_HELLO:
+        case RPC_CMD_DEVICE_COUNT:
+            return true;
+        case RPC_CMD_SET_TENSOR:
+        case RPC_CMD_GRAPH_COMPUTE:
+        case RPC_CMD_GRAPH_RECOMPUTE:
+        case RPC_CMD_COUNT:
+            return false;
+    }
+    return false;
+}
+
+// Write queued items to the socket, strictly in queue order. At most one thread
+// flushes at a time; items appended while another thread is flushing are picked
+// up by that thread. Never holds state->mutex while writing to the socket.
+static bool rpc_flush(const socket_ptr & sock, rpc_async_state * state) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (state->flushing) {
+        return true;
+    }
+    state->flushing = true;
+    while (true) {
+        if (state->sendq.empty()) {
+            state->flushing = false;
+            return true;
+        }
+        auto item = state->sendq.front();
+        state->sendq.pop_front();
+        lock.unlock();
+        bool ok = true;
+        if (!item->bytes.empty()) {
+            ok = sock->send_data(item->bytes.data(), item->bytes.size());
+        }
+        if (ok && !item->owned.empty()) {
+            ok = sock->send_data(item->owned.data(), item->owned.size());
+        }
+        lock.lock();
+        if (!ok) {
+            state->flushing = false;
+            return false;
+        }
+    }
+}
+
+// Append a command to the ordered send queue and flush what can be written.
+// For commands with a response, a pending op is enqueued and the assigned
+// sequence number is returned via out_seq.
+static bool rpc_async_enqueue(const socket_ptr & sock, rpc_async_state * state, enum rpc_cmd cmd,
+                              std::vector<uint8_t> && payload, std::vector<uint8_t> && owned,
+                              void * get_data, size_t get_size,
+                              void * out_data, size_t out_size,
+                              uint64_t * out_seq) {
+    auto item = std::make_shared<rpc_send_item>();
+    const uint64_t input_size = payload.size() + owned.size();
+    item->bytes.resize(1 + sizeof(uint64_t));
+    item->bytes[0] = (uint8_t) cmd;
+    memcpy(item->bytes.data() + 1, &input_size, sizeof(input_size));
+    item->bytes.insert(item->bytes.end(), payload.begin(), payload.end());
+    item->owned = std::move(owned);
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const uint64_t seq = state->next_send_seq++;
+        if (rpc_cmd_has_response(cmd)) {
+            rpc_async_op op;
+            op.cmd = cmd;
+            op.get_data = get_data;
+            op.get_size = get_size;
+            op.out_data = out_data;
+            op.out_size = out_size;
+            state->pending.emplace_back(seq, std::move(op));
+        }
+        if (out_seq) {
+            *out_seq = seq;
+        }
+        state->sendq.push_back(std::move(item));
+    }
+    return rpc_flush(sock, state);
+}
+
+// Send a command asynchronously. For commands with a response, enqueue a pending op.
+static bool rpc_async_send(const socket_ptr & sock, enum rpc_cmd cmd, const void * input, size_t input_size,
+                           void * get_data = nullptr, size_t get_size = 0,
+                           void * out_data = nullptr, size_t out_size = 0,
+                           uint64_t * out_seq = nullptr) {
+    std::vector<uint8_t> payload;
+    if (input_size > 0) {
+        payload.assign((const uint8_t *) input, (const uint8_t *) input + input_size);
+    }
+    auto state = rpc_get_async_state(sock);
+    return rpc_async_enqueue(sock, state.get(), cmd, std::move(payload), {},
+                             get_data, get_size, out_data, out_size, out_seq);
+}
+
+// Send a command asynchronously, moving the payload instead of copying it.
+// For large payloads (e.g. SET_TENSOR / GRAPH_COMPUTE).
+static bool rpc_async_send_owned(const socket_ptr & sock, enum rpc_cmd cmd, std::vector<uint8_t> && payload) {
+    auto state = rpc_get_async_state(sock);
+    return rpc_async_enqueue(sock, state.get(), cmd, {}, std::move(payload),
+                             nullptr, 0, nullptr, 0, nullptr);
+}
+
+// Read and process one response. Never called with state->mutex held.
+static bool rpc_async_drain_one(const socket_ptr & sock, rpc_async_op & op) {
+    uint64_t response_size;
+    if (!sock->recv_data(&response_size, sizeof(response_size))) {
+        return false;
+    }
+
+    if (op.cmd == RPC_CMD_GET_TENSOR) {
+        if (response_size != op.get_size) {
+            return false;
+        }
+        if (!sock->recv_data(op.get_data, op.get_size)) {
+            return false;
+        }
+    } else if (op.out_data != nullptr) {
+        if (response_size != op.out_size) {
+            return false;
+        }
+        if (!sock->recv_data(op.out_data, op.out_size)) {
+            return false;
+        }
+    } else if (response_size > 0) {
+        op.response.resize(response_size);
+        if (!sock->recv_data(op.response.data(), response_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Drain responses until the target sequence number has been reached.
+// At most one thread reads responses at a time; other threads wait for the
+// in-flight read to complete and then re-check their target.
+static bool rpc_async_drain_to(const socket_ptr & sock, uint64_t target_seq) {
+    auto state = rpc_get_async_state(sock);
+    while (true) {
+        rpc_async_op op;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&] { return !state->draining; });
+            if (state->next_recv_seq > target_seq) {
+                return true;
+            }
+            if (state->pending.empty()) {
+                // nothing left to read: the remaining sequence numbers belong to
+                // commands without a response
+                return true;
+            }
+            op = std::move(state->pending.front().second);
+            state->pending.pop_front();
+            state->draining = true;
+        }
+        const bool ok = rpc_async_drain_one(sock, op);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->draining = false;
+            state->next_recv_seq++;
+            state->cv.notify_all();
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+}
+
+// Drain all outstanding responses.
+static bool rpc_async_synchronize(const socket_ptr & sock) {
+    auto state = rpc_get_async_state(sock);
+    uint64_t target;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        target = state->next_send_seq - 1;
+    }
+    return rpc_async_drain_to(sock, target);
+}
+
 // RPC helper functions
 
 // Computes FNV-1a hash of the data
@@ -290,36 +565,18 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-    uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
-    return true;
+    return rpc_async_send(sock, cmd, input, input_size);
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+    uint64_t seq;
+    // pass the response destination as both get_data (used for GET_TENSOR) and out_data
+    if (!rpc_async_send(sock, cmd, input, input_size, output, output_size, output, output_size, &seq)) {
         return false;
     }
-    uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size))) {
-        return false;
-    }
-    if (out_size != output_size) {
-        return false;
-    }
-    if (!sock->recv_data(output, output_size)) {
-        return false;
-    }
-    return true;
+    return rpc_async_drain_to(sock, seq);
 }
 
 // RPC client-side implementation
@@ -484,7 +741,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    bool status = rpc_async_send_owned(ctx->sock, RPC_CMD_SET_TENSOR, std::move(input));
     RPC_STATUS_ASSERT(status);
 }
 
@@ -617,7 +874,6 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
@@ -650,8 +906,83 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    bool status = rpc_async_synchronize(sock);
+    RPC_STATUS_ASSERT(status);
+}
+
+static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    rpc_tensor rpc_t = serialize_tensor(tensor);
+    // The hash-based cache requires reading the server's response before
+    // deciding whether to send the payload, which cannot be done asynchronously.
+    // Activations (the typical async-set payload) are not in the cache anyway,
+    // so always send the full SET_TENSOR command.
+    size_t input_size = sizeof(rpc_t) + sizeof(uint64_t) + size;
+    std::vector<uint8_t> input(input_size, 0);
+    memcpy(input.data(), &rpc_t, sizeof(rpc_t));
+    memcpy(input.data() + sizeof(rpc_t), &offset, sizeof(offset));
+    memcpy(input.data() + sizeof(rpc_t) + sizeof(offset), data, size);
+    bool status = rpc_async_send_owned(sock, RPC_CMD_SET_TENSOR, std::move(input));
+    RPC_STATUS_ASSERT(status);
+}
+
+static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    rpc_msg_get_tensor_req request;
+    request.tensor = serialize_tensor(tensor);
+    request.offset = offset;
+    request.size = size;
+    bool status = rpc_async_send(sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+    RPC_STATUS_ASSERT(status);
+}
+
+static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend_dst->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+
+    if (ggml_backend_buffer_is_rpc(src->buffer)) {
+        // COPY_TENSOR only works when both tensors live on the same RPC server.
+        ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src->buffer->context;
+        if (src_ctx->sock == sock) {
+            rpc_msg_copy_tensor_req request;
+            request.src = serialize_tensor(src);
+            request.dst = serialize_tensor(dst);
+            bool status = rpc_async_send(sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request));
+            RPC_STATUS_ASSERT(status);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    // The recorded sequence number must correspond to a response-bearing
+    // command so that event_wait can drain the response as a completion
+    // marker. GRAPH_COMPUTE has no response, so append a tiny no-op
+    // GET_DEVICE_MEMORY command and record its sequence number.
+    rpc_msg_get_device_memory_req request;
+    request.device = rpc_ctx->device;
+    uint64_t seq;
+    bool status = rpc_async_send(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), nullptr, 0, nullptr, 0, &seq);
+    RPC_STATUS_ASSERT(status);
+
+    *(uint64_t *)event->context = seq;
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)event->device->context;
+    auto sock = get_socket(dev_ctx->endpoint.c_str());
+    uint64_t seq = *(uint64_t *)event->context;
+    bool status = rpc_async_drain_to(sock, seq);
+    RPC_STATUS_ASSERT(status);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -700,21 +1031,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
+    auto sock = get_socket(rpc_ctx->endpoint);
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        bool status = rpc_async_send(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        bool status = rpc_async_send_owned(sock, RPC_CMD_GRAPH_COMPUTE, std::move(input));
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -723,19 +1053,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
-    /* .set_tensor_async        = */ NULL,
-    /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
+    /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -1795,11 +2125,15 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->description = ggml_backend_rpc_device_get_description(dev);
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    // Advertise async + event support so that the scheduler enables pipeline
+    // parallelism when RPC devices are used together with local GPUs.
+    // GGML_RPC_DISABLE_ASYNC=1 forces the legacy synchronous behaviour.
+    const bool async = rpc_async_enabled();
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ async,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ async,
     };
 }
 
@@ -1817,6 +2151,27 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
     return ggml_backend_rpc_buffer_type(ctx->endpoint.c_str(), ctx->device);
 
     GGML_UNUSED(dev);
+}
+
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_event_t event = new ggml_backend_event;
+    event->device = dev;
+    event->context = new uint64_t(0);
+    return event;
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    delete (uint64_t *)event->context;
+    delete event;
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(event);
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto sock = get_socket(ctx->endpoint.c_str());
+    bool status = rpc_async_synchronize(sock);
+    RPC_STATUS_ASSERT(status);
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -1848,9 +2203,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_device_event_new,
+    /* .event_free           = */ ggml_backend_rpc_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
 };
 
 // backend reg interface
