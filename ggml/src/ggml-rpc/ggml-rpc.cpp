@@ -11,6 +11,7 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -268,6 +269,13 @@ struct rpc_send_item {
     std::vector<uint8_t> bytes;
     // additional payload written after bytes (owned by the item)
     std::vector<uint8_t> owned;
+    // additional payload written after owned (not owned by the item, e.g. a
+    // forwarder's staging buffer); only set together with ready = true
+    const void * ext_data = nullptr;
+    size_t ext_size = 0;
+    bool free_ext = false;
+    // false while the slot is reserved but its payload is not available yet
+    bool ready = true;
 };
 
 struct rpc_async_state {
@@ -346,7 +354,7 @@ static bool rpc_flush(const socket_ptr & sock, rpc_async_state * state) {
     }
     state->flushing = true;
     while (true) {
-        if (state->sendq.empty()) {
+        if (state->sendq.empty() || !state->sendq.front()->ready) {
             state->flushing = false;
             return true;
         }
@@ -359,6 +367,12 @@ static bool rpc_flush(const socket_ptr & sock, rpc_async_state * state) {
         }
         if (ok && !item->owned.empty()) {
             ok = sock->send_data(item->owned.data(), item->owned.size());
+        }
+        if (ok && item->ext_size > 0) {
+            ok = sock->send_data(item->ext_data, item->ext_size);
+        }
+        if (item->free_ext) {
+            free((void *) item->ext_data);
         }
         lock.lock();
         if (!ok) {
@@ -500,6 +514,82 @@ static bool rpc_async_synchronize(const socket_ptr & sock) {
         target = state->next_send_seq - 1;
     }
     return rpc_async_drain_to(sock, target);
+}
+
+// Cross-backend tensor copy support (host relay).
+// A forward request fetches a tensor into a host staging buffer (from another
+// RPC server, or from a local backend such as CUDA) and then fills in the
+// SET_TENSOR slot that was reserved on the destination socket's send queue by
+// ggml_backend_rpc_cpy_tensor_async. A single forwarder thread processes the
+// requests in order, so forwarders never wait on each other.
+
+struct rpc_fwd_request {
+    // source
+    bool src_is_rpc = false;
+    socket_ptr src_sock;                    // RPC source: wait for the GET_TENSOR response
+    uint64_t src_seq = 0;
+    ggml_backend_t src_backend = nullptr;   // local source: synchronize the backend
+    // relay buffer
+    void * staging = nullptr;
+    size_t size = 0;
+    // destination
+    socket_ptr dst_sock;
+    std::shared_ptr<rpc_send_item> dst_item;
+};
+
+// NOTE: these globals are intentionally leaked (never destroyed at exit): the
+// detached forwarder thread may still be waiting on them while the process
+// tears down static objects.
+static std::mutex & g_fwd_mutex = *new std::mutex;
+static std::condition_variable & g_fwd_cv = *new std::condition_variable;
+static std::deque<std::shared_ptr<rpc_fwd_request>> & g_fwd_queue = *new std::deque<std::shared_ptr<rpc_fwd_request>>;
+
+static void rpc_forwarder_loop() {
+    while (true) {
+        std::shared_ptr<rpc_fwd_request> req;
+        {
+            std::unique_lock<std::mutex> lock(g_fwd_mutex);
+            g_fwd_cv.wait(lock, [] { return !g_fwd_queue.empty(); });
+            req = g_fwd_queue.front();
+            g_fwd_queue.pop_front();
+        }
+
+        // wait until the source data is valid in the staging buffer
+        const int64_t t0 = ggml_time_us();
+        bool status = true;
+        if (req->src_is_rpc) {
+            status = rpc_async_drain_to(req->src_sock, req->src_seq);
+        } else {
+            ggml_backend_synchronize(req->src_backend);
+        }
+        LOG_DBG("[%s] waited %lld us for source data\n", __func__, (long long)(ggml_time_us() - t0));
+        RPC_STATUS_ASSERT(status);
+
+        // fill in the reserved SET_TENSOR slot on the destination socket
+        auto state = rpc_get_async_state(req->dst_sock);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            req->dst_item->ext_data = req->staging;
+            req->dst_item->ext_size = req->size;
+            req->dst_item->free_ext = true;
+            req->dst_item->ready = true;
+        }
+        status = rpc_flush(req->dst_sock, state.get());
+        LOG_DBG("[%s] flushed SET_TENSOR to dst after %lld us total\n", __func__, (long long)(ggml_time_us() - t0));
+        RPC_STATUS_ASSERT(status);
+    }
+}
+
+static void rpc_forwarder_enqueue(std::shared_ptr<rpc_fwd_request> req) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread(rpc_forwarder_loop).detach();
+    });
+    {
+        std::lock_guard<std::mutex> lock(g_fwd_mutex);
+        g_fwd_queue.push_back(std::move(req));
+    }
+    g_fwd_cv.notify_one();
 }
 
 // RPC helper functions
@@ -957,7 +1047,76 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_b
         }
     }
 
-    return false;
+    // Cross-backend copy: the source tensor lives on a different RPC server or on
+    // a local backend (e.g. CUDA). Relay the data through a host staging buffer,
+    // without blocking the caller: reserve the SET_TENSOR slot on the destination
+    // socket's send queue now (so that any subsequent GRAPH_COMPUTE is ordered
+    // behind it) and let the forwarder thread fetch the data and fill the slot in.
+    if (!rpc_async_enabled()) {
+        // GGML_RPC_DISABLE_ASYNC=1: keep the legacy synchronous fallback
+        return false;
+    }
+
+    const size_t size = ggml_nbytes(src);
+    GGML_ASSERT(size == ggml_nbytes(dst));
+
+    LOG_DBG("[%s] cross-backend relay: %zu bytes from %s to %s\n", __func__, size,
+            ggml_backend_name(backend_src), ggml_backend_name(backend_dst));
+
+    void * staging = malloc(size);
+    if (staging == nullptr) {
+        // fall back to the synchronous copy path
+        return false;
+    }
+
+    auto fwd = std::make_shared<rpc_fwd_request>();
+    fwd->staging  = staging;
+    fwd->size     = size;
+    fwd->dst_sock = sock;
+
+    if (ggml_backend_buffer_is_rpc(src->buffer)) {
+        // fetch src from the source server; GET_TENSOR is queued behind the
+        // GRAPH_COMPUTE that produces the tensor
+        ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src->buffer->context;
+        fwd->src_is_rpc = true;
+        fwd->src_sock   = src_ctx->sock;
+
+        rpc_msg_get_tensor_req request;
+        request.tensor = serialize_tensor(src);
+        request.offset = 0;
+        request.size   = size;
+        bool status = rpc_async_send(fwd->src_sock, RPC_CMD_GET_TENSOR, &request, sizeof(request),
+                                     staging, size, nullptr, 0, &fwd->src_seq);
+        RPC_STATUS_ASSERT(status);
+    } else {
+        // local backend (e.g. CUDA): queue an async D2H copy; the forwarder waits for it
+        fwd->src_is_rpc  = false;
+        fwd->src_backend = backend_src;
+        ggml_backend_tensor_get_async(backend_src, src, staging, 0, size);
+    }
+
+    // reserve the SET_TENSOR slot on the destination socket
+    {
+        auto item = std::make_shared<rpc_send_item>();
+        const rpc_tensor rpc_t = serialize_tensor(dst);
+        const uint64_t offset = 0;
+        const uint64_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+        item->bytes.resize(1 + sizeof(uint64_t) + sizeof(rpc_tensor) + sizeof(uint64_t));
+        item->bytes[0] = RPC_CMD_SET_TENSOR;
+        memcpy(item->bytes.data() + 1, &input_size, sizeof(input_size));
+        memcpy(item->bytes.data() + 1 + sizeof(uint64_t), &rpc_t, sizeof(rpc_tensor));
+        memcpy(item->bytes.data() + 1 + sizeof(uint64_t) + sizeof(rpc_tensor), &offset, sizeof(offset));
+        item->ready = false;
+        fwd->dst_item = item;
+
+        auto state = rpc_get_async_state(sock);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->next_send_seq++;  // SET_TENSOR has no response
+        state->sendq.push_back(std::move(item));
+    }
+
+    rpc_forwarder_enqueue(std::move(fwd));
+    return true;
 }
 
 static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
