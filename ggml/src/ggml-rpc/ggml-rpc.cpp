@@ -217,6 +217,19 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+
+    // Client-side cache for get_alloc_size queries (see ggml_backend_rpc_buffer_type_get_alloc_size).
+    // Synchronous queries are expensive: the server processes commands in order, so a query sent
+    // while the server is still computing the previous graph only gets answered once that compute
+    // is done, which serializes the pipeline.
+    std::mutex alloc_mutex;
+    // full request key (tensor + srcs) -> alloc_size, for requests where the server returned
+    // something other than ggml_nbytes(tensor)
+    std::unordered_map<uint64_t, uint64_t> alloc_cache;
+    // tensor signature -> src signatures for which the server returned exactly ggml_nbytes(tensor).
+    // Once two distinct src signatures confirm this, the alloc size for this tensor signature is
+    // computed locally and never queried again.
+    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> alloc_local_matches;
 };
 
 struct ggml_backend_rpc_context {
@@ -937,6 +950,26 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
     return buft_ctx->max_size;
 }
 
+// Hash of the shape-determining fields of a get_alloc_size request.
+// Ids, pointers and names are excluded: they vary between calls but do not affect the size.
+static uint64_t rpc_alloc_tensor_sig(const rpc_tensor & t) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    auto mix = [&h](const void * data, size_t len) {
+        const uint8_t * p = (const uint8_t *) data;
+        for (size_t i = 0; i < len; i++) {
+            h ^= p[i];
+            h *= 0x100000001b3ULL;
+        }
+    };
+    mix(&t.type,      sizeof(t.type));
+    mix(t.ne,         sizeof(t.ne));
+    mix(t.nb,         sizeof(t.nb));
+    mix(&t.op,        sizeof(t.op));
+    mix(t.op_params,  sizeof(t.op_params));
+    mix(&t.flags,     sizeof(t.flags));
+    return h;
+}
+
 static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // should we query the remote server for the actual size
     bool rpc_get = false;
@@ -964,10 +997,46 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
+        // The server answers queries in order, so a query sent while it is still computing
+        // blocks until that compute is done. Cache the responses to keep graph (re)allocation
+        // off the critical path:
+        // - if the server returns something other than ggml_nbytes(tensor), cache the exact
+        //   request (tensor + srcs) and always re-query on any src shape change,
+        // - if it returns exactly ggml_nbytes(tensor) for two distinct src shapes, the size
+        //   does not depend on the srcs and is computed locally from then on.
+        const uint64_t tensor_sig = rpc_alloc_tensor_sig(request.tensor);
+        uint64_t src_sig = 0xcbf29ce484222325ULL;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            src_sig ^= rpc_alloc_tensor_sig(request.srcs[i]) + 0x9e3779b97f4a7c15ULL + (src_sig << 6) + (src_sig >> 2);
+        }
+        const uint64_t full_key = tensor_sig ^ (src_sig + 0x9e3779b97f4a7c15ULL + (tensor_sig << 6) + (tensor_sig >> 2));
+
+        const size_t local_size = ggml_nbytes(tensor);
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_mutex);
+            auto it = buft_ctx->alloc_local_matches.find(tensor_sig);
+            if (it != buft_ctx->alloc_local_matches.end() &&
+                (it->second.size() >= 2 || it->second.count(src_sig) > 0)) {
+                return local_size;
+            }
+            auto itc = buft_ctx->alloc_cache.find(full_key);
+            if (itc != buft_ctx->alloc_cache.end()) {
+                return itc->second;
+            }
+        }
+
         rpc_msg_get_alloc_size_rsp response;
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
+        {
+            std::lock_guard<std::mutex> lock(buft_ctx->alloc_mutex);
+            if (response.alloc_size == local_size) {
+                buft_ctx->alloc_local_matches[tensor_sig].insert(src_sig);
+            } else {
+                buft_ctx->alloc_cache[full_key] = response.alloc_size;
+            }
+        }
         return response.alloc_size;
     }
 
