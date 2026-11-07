@@ -869,6 +869,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
     // ID path (experts) uses 16-weight half-sub-block units: expert
     // tensors are small-K (down-proj K=768 -> 24 sub-blocks for 64
     // lanes) and full units leave most of the wave idle. The -deff*sx
@@ -927,20 +936,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         uint32_t dd[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
-            q[r]  = nib[(size_t) row * nsp + sb];
-            sm[r] = smp[(size_t) row * nsp + sb];
-            dd[r] = ddp[(size_t) row * n_super + (sb >> 3)];
+            q[r]  = nib[row_idx[r] + sb];
+            sm[r] = smp[row_idx[r] + sb];
+            dd[r] = ddp[row_sup[r] + (sb >> 3)];
         }
         if constexpr (FENCE) {
             __builtin_amdgcn_sched_barrier(0);
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
-            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm[r] & 0xFFu);
-            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[r] >> 8);
+            const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
+            const float dsc  = d_dmin.x * (float)(sm[r] & 0xFFu);
+            const float deff = d_dmin.y * (float)(sm[r] >> 8);
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
