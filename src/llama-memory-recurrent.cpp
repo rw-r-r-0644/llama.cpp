@@ -694,10 +694,20 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
 
         rs_z = -1;
+        bool has_cleared = false;
         for (int i = min; i <= max; ++i) {
-            if (refcounts[i] == 0) {
-                rs_z = i;
+            if (cells[i].src < 0) {
+                has_cleared = true;
                 break;
+            }
+        }
+
+        if (has_cleared) {
+            for (int i = min; i <= max; ++i) {
+                if (refcounts[i] == 0) {
+                    rs_z = i;
+                    break;
+                }
             }
         }
 

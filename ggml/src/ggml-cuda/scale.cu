@@ -30,6 +30,9 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
 template <typename T>
 static void scale_f32_cuda(const T * x, T * dst, const float scale, const float bias, const ggml_tensor * src0, const ggml_tensor * t, cudaStream_t stream) {
     const int64_t k  = ggml_nelements(src0);
+    if (k == 0) {
+        return;
+    }
     const size_t  ts = sizeof(T);
     GGML_ASSERT(k <= std::numeric_limits<uint32_t>::max());
 
