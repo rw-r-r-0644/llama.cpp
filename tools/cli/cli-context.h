@@ -14,6 +14,8 @@
 struct cli_timings {
     double prompt_per_second    = 0.0;
     double predicted_per_second = 0.0;
+    int    draft_n              = 0;
+    int    draft_n_accepted     = 0;
 };
 
 struct cli_context_impl;

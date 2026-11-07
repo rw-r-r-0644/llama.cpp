@@ -376,6 +376,8 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             const auto & t = chunk.at("timings");
             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+            timings.draft_n              = t.value("draft_n",              0);
+            timings.draft_n_accepted     = t.value("draft_n_accepted",     0);
         }
         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
             return;
@@ -653,10 +655,17 @@ int cli_context::run() {
         }
 
         if (params.show_timings) {
+            std::string draft_str = "";
+            if (timings.draft_n > 0) {
+                draft_str = string_format(" | Draft: %d/%d (%.1f%%)",
+                    timings.draft_n_accepted, timings.draft_n,
+                    100.0 * timings.draft_n_accepted / timings.draft_n);
+            }
             ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s%s ]",
                 timings.prompt_per_second,
-                timings.predicted_per_second
+                timings.predicted_per_second,
+                draft_str.c_str()
             ));
         }
 

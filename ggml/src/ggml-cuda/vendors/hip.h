@@ -121,7 +121,10 @@
 #define cudaStreamNonBlocking hipStreamNonBlocking
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaStreamSynchronize hipStreamSynchronize
-#define cudaStreamWaitEvent hipStreamWaitEvent
+inline hipError_t ggml_hipStreamWaitEvent(hipStream_t stream, hipEvent_t event, unsigned int flags = 0) {
+    return hipStreamWaitEvent(stream, event, flags);
+}
+#define cudaStreamWaitEvent ggml_hipStreamWaitEvent
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t
 #define cudaKernelNodeParams hipKernelNodeParams
