@@ -1051,6 +1051,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
     const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
     for (uint32_t u = lane; u < n_unit; u += 64) {
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
@@ -1119,41 +1128,39 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         uint32_t dd[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
-            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
-            const size_t   idx = (size_t) row * nsp + sb;
+            const size_t idx = row_idx[r] + sb;
             q[r]  = nib[idx];
             qh[r] = qhp[idx];
             sm[r] = smp[idx];
-            dd[r] = ddp[(size_t) row * n_super + (sb >> 3)];
+            dd[r] = ddp[row_sup[r] + (sb >> 3)];
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const uint16_t d_bits    = (uint16_t)(dd[r] & 0xFFFF);
-            const uint16_t dmin_bits = (uint16_t)(dd[r] >> 16);
-            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits))    * (float)(sm[r] & 0xFFu);
-            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[r] >> 8);
+            const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
+            const float dsc  = d_dmin.x * (float)(sm[r] & 0xFFu);
+            const float deff = d_dmin.y * (float)(sm[r] >> 8);
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
             int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
             if constexpr (HAS_IDS) {
-                const uint32_t lo0 = ( qa[j0]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j0))     & 0xFu);
-                const uint32_t hi0 = ((qa[j0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j0 + 4)) & 0xFu);
-                const uint32_t lo1 = ( qa[j0+1]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * (j0+1)))     & 0xFu);
-                const uint32_t hi1 = ((qa[j0+1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * (j0+1) + 4)) & 0xFu);
+                const uint32_t lo0 = ( qa[j0]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> (8 * j0));
+                const uint32_t hi0 = ((qa[j0] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> (8 * j0 + 4));
+                const uint32_t lo1 = ( qa[j0+1]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> (8 * (j0+1)));
+                const uint32_t hi1 = ((qa[j0+1] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> (8 * (j0+1) + 4));
                 dot0 = ggml_cuda_dp4a((int) lo0, xq32[j0],         0);
                 dot1 = ggml_cuda_dp4a((int) hi0, xq32[j0 + 4],     0);
                 dot2 = ggml_cuda_dp4a((int) lo1, xq32[j0 + 1],     0);
                 dot3 = ggml_cuda_dp4a((int) hi1, xq32[j0 + 1 + 4], 0);
             } else {
-                const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 0)  & 0xFu);
-                const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 4)  & 0xFu);
-                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 8)  & 0xFu);
-                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 12) & 0xFu);
-                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 16) & 0xFu);
-                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 20) & 0xFu);
-                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 24) & 0xFu);
-                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 28) & 0xFu);
+                const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 0);
+                const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 4);
+                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 8);
+                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 12);
+                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 16);
+                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 20);
+                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 24);
+                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 28);
 
                 dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
                 dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
