@@ -887,8 +887,9 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
-        const float sx = __high2float(xb->ds);
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
@@ -1072,8 +1073,9 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
-        const float sx = __high2float(xb->ds);
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
@@ -1162,20 +1164,21 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
             } else {
                 const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 0);
                 const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 4);
-                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 8);
-                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 12);
-                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 16);
-                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 20);
-                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 24);
-                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 28);
-
                 dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
                 dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+
+                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 8);
+                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 12);
                 dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
                 dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
 
+                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 16);
+                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 20);
                 dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
                 dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+
+                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 24);
+                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4(qh[r] >> 28);
                 dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
                 dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
             }
@@ -1472,8 +1475,9 @@ static __global__ void mul_mat_vec_q5_1_repacked(
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
-        const float sx = __high2float(xb->ds);
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
 #pragma unroll
@@ -2736,8 +2740,9 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
-        const float sx = __high2float(xb->ds);
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
