@@ -1586,6 +1586,48 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// MUL_MAT_ID routing + activation cache for the GCN repack path (repack-gcn.cu).
+// gate/up/down of one MoE layer share the ids tensor, gate/up share src1.
+// Valid only while gen == ctx.graph_gen. Device buffers are grow-only and
+// outgrown ones are kept until destruction: captured graphs may still use them.
+struct ggml_cuda_repack_route_cache {
+    uint64_t            gen      = 0;
+    const ggml_tensor * ids      = nullptr;
+    const void        * ids_data = nullptr;
+    int64_t n_tokens = 0, n_used = 0, ne02 = 0, si1 = 0, ne11 = 0;
+    int32_t * ids_src1 = nullptr, * ids_dst = nullptr, * bounds = nullptr, * tile_off = nullptr, * tile_expert = nullptr;
+    void    * route_buf = nullptr;
+    size_t    cap       = 0;
+
+    uint64_t            x_gen  = 0;
+    const ggml_tensor * x      = nullptr;
+    const void        * x_data = nullptr;
+    int64_t x_ne0 = 0, x_ne1 = 0, x_ne2 = 0;
+    char  * xq     = nullptr;
+    size_t  xq_cap = 0;
+
+    // decode activation cache: q8_1 copies of recently quantized src1, reused while
+    // no node has written their range (ggml_cuda_repack_xq_invalidate)
+    struct xq_entry {
+        uint64_t     gen  = 0;
+        const void * data = nullptr;
+        int64_t      ne[4] = {};
+        size_t       nb[4] = {};
+        const char * lo = nullptr, * hi = nullptr;
+        char       * buf = nullptr;
+        size_t       cap = 0;
+        // written by the producing kernel (ggml_cuda_repack_xq_emit_target): flat q8_1 blocks
+        // of a contiguous tensor, valid for single-column consumers reading <= flat_n values
+        const ggml_tensor * producer = nullptr;
+        int64_t             flat_n   = 0;
+    };
+    static constexpr int N_XQ = 8;
+    xq_entry xqc[N_XQ];
+    int      xqc_next = 0;
+
+    std::vector<void *> retired;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1661,6 +1703,10 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    uint64_t graph_gen = 0; // bumped per graph_compute
+    const ggml_cgraph * cur_cgraph = nullptr; // graph being evaluated (for ops that look at their neighbours)
+    ggml_cuda_repack_route_cache repack_rc;
 
     ~ggml_backend_cuda_context();
 
