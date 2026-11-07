@@ -1363,6 +1363,17 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
             xs3 = ggml_cuda_dp4a(0x01010101, xq32[7], xs3);
             xqsum = (xs0 + xs1) + (xs2 + xs3);
         }
+        uint4    q[2][ROWS];
+        uint16_t db[2][ROWS];
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const size_t idx = row_idx[r] + sb;
+                q[w2][r]  = nib[w2][idx];
+                db[w2][r] = dp[w2][idx];
+            }
+        }
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
 #pragma unroll
@@ -1371,11 +1382,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
                 if (row >= (int) ne1) {
                     continue;
                 }
-                const size_t   idx = row_idx[r] + sb;
-                const uint4    q   = nib[w2][idx];
-                const uint16_t db  = dp[w2][idx];
-                const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
-                const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
+                const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[w2][r]));
+                const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
                 int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
                 if constexpr (MODE == REPACK_NIB_Q4_0) {
                     dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
@@ -1405,7 +1413,11 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
                     dot3 = ggml_cuda_dp4a(hi3, xq32[7], dot3);
                 }
                 const int idot = (dot0 + dot1) + (dot2 + dot3);
-                acc[w2][r] += dw * dx * (float) (idot - 8 * xqsum);
+                if constexpr (MODE == REPACK_NIB_Q4_0) {
+                    acc[w2][r] += dw * dx * (float) (idot - 8 * xqsum);
+                } else {
+                    acc[w2][r] += dw * dx * (float) idot;
+                }
             }
         }
     }
