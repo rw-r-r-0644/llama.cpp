@@ -361,6 +361,43 @@ static __global__ void rms_norm_scale2_f32(const float * x0, float * dst0, const
     }
 }
 
+static __global__ void __launch_bounds__(256) rms_norm_mul_sigmoid_gate_f32(
+        const float * x, const int64_t sx1, const int64_t sx2, const int64_t sx3, const float * __restrict__ mul, const int64_t smul1,
+        const float * z, const int64_t sz1, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x += sample*sx3 + channel*sx2 + row*sx1;
+    const int64_t lrow = ((int64_t) sample*nchannels + channel)*nrows + row;
+    const float * zr = z + lrow*sz1;
+    const float * mr = mul + row*smul1;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += 256) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += 256) {
+        const float nv = scale * x[col] * mr[col];
+        const float v  = (1.0f / (1.0f + expf(-zr[col]))) * nv;
+        dst[lrow*ncols + col] = v;
+        if (yq != nullptr) {
+            rms_emit_q8_1(yq, lrow*ncols + col, v);
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -795,6 +832,31 @@ bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor *
     rms_norm_scale2_f32<256><<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
         (const float *) x0->data, (float *) sc0->data, (const float *) x1->data, (float *) sc1->data, (int) x0->ne[0],
         x0->nb[1] / ts, x0->nb[2] / ts, x0->nb[3] / ts, (int) x0->ne[3], eps, sv, bv);
+    return true;
+}
+
+bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+        ggml_tensor * sig, ggml_tensor * gate_mul, void * yq) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const ggml_tensor * z = sig->src[0];
+    const int64_t ncols = x->ne[0];
+    const bool w_bcast = ggml_nelements(w) == ncols;
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || gate_mul->type != GGML_TYPE_F32 ||
+            x->nb[0] != sizeof(float) || z->nb[0] != sizeof(float) || !ggml_is_contiguous(w) || ncols > 256 || ncols % QK8_1 != 0 ||
+            !(w_bcast || (w->ne[0] == ncols && w->ne[1] == x->ne[1] && ggml_nelements(w) == ncols * x->ne[1])) ||
+            !ggml_is_contiguous(gate_mul) || ggml_nelements(z) != ggml_nelements(gate_mul) || z->ne[0] != ncols ||
+            z->nb[2] != z->ne[1] * z->nb[1] || z->nb[3] != z->ne[2] * z->nb[2] ||
+            !ggml_are_same_shape(mul_tensor, x) || !ggml_are_same_shape(gate_mul, mul_tensor)) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
+    rms_norm_mul_sigmoid_gate_f32<<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
+        (const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+        (const float *) w->data, w_bcast ? 0 : ncols, (const float *) z->data, z->nb[1] / sizeof(float),
+        (float *) gate_mul->data, (int) ncols, eps, (block_q8_1 *) yq);
     return true;
 }
 
