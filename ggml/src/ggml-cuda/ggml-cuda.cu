@@ -1665,6 +1665,229 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+#if defined(GGML_USE_HIP)
+// F32 GEMMs launched on GCN (gfx906), where rocBLAS on ROCm 7.1/7.2 ships no gfx906 Tensile for
+// some shapes and the MMA-based mmf path needs matrix cores gfx906 lacks.
+// Contract: C[m + n*ldc] = sum_k A[m*lda + k]*B[n*ldb + k].
+// M > 16: 64x64 output tile per 256-thread block, 4x4 outputs per thread, K staged through LDS in
+// 16-wide slices stored k-major so the inner loop reads float4s.
+#define GCN_F32_RB_BM 64
+#define GCN_F32_RB_BN 64
+#define GCN_F32_RB_BK 16
+
+// k in [k_begin, K): the whole range for the plain GEMM, one slice for split-K
+template <bool VEC>
+static __device__ __forceinline__ void gcn_f32_gemm_tn_rb_body(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc, const int k_begin) {
+    __shared__ float As[GCN_F32_RB_BK][GCN_F32_RB_BM + 4];
+    __shared__ float Bs[GCN_F32_RB_BK][GCN_F32_RB_BN + 4];
+
+    const int tid = threadIdx.x;
+    const int tn  = tid % 16;
+    const int tm  = tid / 16;
+    const int m0  = blockIdx.y * GCN_F32_RB_BM;
+    const int n0  = blockIdx.x * GCN_F32_RB_BN;
+
+    // each thread loads 4 consecutive k of one row of A and one row of B per slice
+    const int lr = tid / 4;
+    const int lk = (tid % 4) * 4;
+
+    float acc[4][4] = {{0.0f}};
+
+    for (int k0 = k_begin; k0 < K; k0 += GCN_F32_RB_BK) {
+        const int k = k0 + lk;
+        float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const int m = m0 + lr;
+        const int n = n0 + lr;
+        if (VEC && k + 3 < K) {
+            if (m < M) { a = *(const float4 *) (A + (size_t) m * lda + k); }
+            if (n < N) { b = *(const float4 *) (B + (size_t) n * ldb + k); }
+        } else {
+            if (m < M) {
+                a.x = k + 0 < K ? A[(size_t) m * lda + k + 0] : 0.0f;
+                a.y = k + 1 < K ? A[(size_t) m * lda + k + 1] : 0.0f;
+                a.z = k + 2 < K ? A[(size_t) m * lda + k + 2] : 0.0f;
+                a.w = k + 3 < K ? A[(size_t) m * lda + k + 3] : 0.0f;
+            }
+            if (n < N) {
+                b.x = k + 0 < K ? B[(size_t) n * ldb + k + 0] : 0.0f;
+                b.y = k + 1 < K ? B[(size_t) n * ldb + k + 1] : 0.0f;
+                b.z = k + 2 < K ? B[(size_t) n * ldb + k + 2] : 0.0f;
+                b.w = k + 3 < K ? B[(size_t) n * ldb + k + 3] : 0.0f;
+            }
+        }
+        As[lk + 0][lr] = a.x; As[lk + 1][lr] = a.y; As[lk + 2][lr] = a.z; As[lk + 3][lr] = a.w;
+        Bs[lk + 0][lr] = b.x; Bs[lk + 1][lr] = b.y; Bs[lk + 2][lr] = b.z; Bs[lk + 3][lr] = b.w;
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < GCN_F32_RB_BK; ++kk) {
+            const float4 av = *(const float4 *) &As[kk][tm * 4];
+            const float4 bv = *(const float4 *) &Bs[kk][tn * 4];
+            const float ar[4] = {av.x, av.y, av.z, av.w};
+            const float br[4] = {bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] += ar[i] * br[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int n = n0 + tn * 4 + j;
+        if (n >= N) {
+            continue;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int m = m0 + tm * 4 + i;
+            if (m < M) {
+                C[(size_t) m + (size_t) n * ldc] = acc[i][j];
+            }
+        }
+    }
+}
+
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C, M, N, K, lda, ldb, ldc, 0);
+}
+
+// Split-K: blockIdx.z takes k in [z*k_chunk, min(K, (z+1)*k_chunk)) and
+// writes its partial C to C + z*split_stride; gcn_f32_splitk_reduce sums the slices in z order
+// (deterministic). For skinny GEMMs (MoE router, GDN alpha/beta) that give a few tiles on 60 CUs.
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb_splitk(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const int k_chunk, const int64_t split_stride) {
+    const int kb = blockIdx.z * k_chunk;
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C + (size_t) blockIdx.z * split_stride, M, N, min(K, kb + k_chunk), lda, ldb, ldc, kb);
+}
+
+static __global__ void __launch_bounds__(256) gcn_f32_splitk_reduce(
+        const float * __restrict__ part, float * __restrict__ y, const int64_t n, const int splits) {
+    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float acc = part[i];
+    for (int z = 1; z < splits; z++) {
+        acc += part[(size_t) z * n + i];
+    }
+    y[i] = acc;
+}
+
+// Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
+// all threads (float4 loads when the strides allow it), MT partial sums per thread,
+// then a wave reduction and a cross-wave LDS reduction per row.
+#define GCN_F32_SKINNY_MAX_M   16
+#define GCN_F32_SKINNY_THREADS 256
+
+template <int MT, bool VEC>
+static __global__ void gcn_f32_gemm_skinny(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int n_waves   = GCN_F32_SKINNY_THREADS / warp_size;
+    __shared__ float red[n_waves][MT];
+
+    const int n    = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+    const int wave = tid / warp_size;
+
+    float acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        acc[m] = 0.0f;
+    }
+
+    const float * b = B + (size_t) n * ldb;
+    if constexpr (VEC) {
+        const int K4 = K / 4;
+        for (int k4 = tid; k4 < K4; k4 += GCN_F32_SKINNY_THREADS) {
+            const float4 bv = *(const float4 *) (b + 4 * k4);
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m < M) {
+                    const float4 av = *(const float4 *) (A + (size_t) m * lda + 4 * k4);
+                    acc[m] += av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
+                }
+            }
+        }
+    } else {
+        for (int k = tid; k < K; k += GCN_F32_SKINNY_THREADS) {
+            const float bk = b[k];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m < M) {
+                    acc[m] += A[(size_t) m * lda + k] * bk;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        if (m < M) {
+            const float v = warp_reduce_sum<warp_size>(acc[m]);
+            if (lane == 0) {
+                red[wave][m] = v;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid < M) {
+        float s = 0.0f;
+#pragma unroll
+        for (int w = 0; w < n_waves; ++w) {
+            s += red[w][tid];
+        }
+        C[(size_t) tid + (size_t) n * ldc] = s;
+    }
+}
+
+template <int MT>
+static void gcn_f32_gemm_skinny_launch_mt(
+        const float * A, const float * B, float * C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const bool vec, cudaStream_t stream) {
+    const dim3 block(GCN_F32_SKINNY_THREADS);
+    const dim3 grid(N);
+    if (vec) {
+        gcn_f32_gemm_skinny<MT, true><<<grid, block, 0, stream>>>(A, B, C, M, N, K, lda, ldb, ldc);
+    } else {
+        gcn_f32_gemm_skinny<MT, false><<<grid, block, 0, stream>>>(A, B, C, M, N, K, lda, ldb, ldc);
+    }
+}
+
+static void gcn_f32_gemm_skinny_launch(
+        const float * A, const float * B, float * C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        cudaStream_t stream) {
+    const bool vec = K % 4 == 0 && lda % 4 == 0 && ldb % 4 == 0 &&
+                     ((uintptr_t) A % 16 == 0) && ((uintptr_t) B % 16 == 0);
+    if (M <= 4) {
+        gcn_f32_gemm_skinny_launch_mt<4>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    } else if (M <= 8) {
+        gcn_f32_gemm_skinny_launch_mt<8>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    } else {
+        gcn_f32_gemm_skinny_launch_mt<16>(A, B, C, M, N, K, lda, ldb, ldc, vec, stream);
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1801,6 +2024,57 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+#if defined(GGML_USE_HIP)
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            if (ne01 <= GCN_F32_SKINNY_MAX_M) {
+                gcn_f32_gemm_skinny_launch(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10,
+                    (int) s01, (int) s11, (int) ldc, main_stream);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            const dim3 block(256);
+            const dim3 grid((ne11 + GCN_F32_RB_BN - 1) / GCN_F32_RB_BN, (ne01 + GCN_F32_RB_BM - 1) / GCN_F32_RB_BM);
+            const bool vec = s01 % 4 == 0 && s11 % 4 == 0 &&
+                (uintptr_t) src0_ptr % 16 == 0 && (uintptr_t) src1_ptr % 16 == 0;
+            // skinny problems: split K until ~2 tiles per CU, each slice >= 128 deep
+            static const bool no_splitk = getenv("GGML_CUDA_NO_F32_SPLITK") != nullptr;
+            int splits = 1;
+            while (!no_splitk && (int64_t) grid.x * grid.y * splits < 120 && ne10 / (2 * splits) >= 128) {
+                splits *= 2;
+            }
+            if (splits > 1) {
+                const int k_chunk = (int) ((((ne10 + splits - 1) / splits) + GCN_F32_RB_BK - 1) / GCN_F32_RB_BK * GCN_F32_RB_BK);
+                const int64_t n_out = (int64_t) ldc * ne11;
+                ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) n_out * splits);
+                const dim3 gridz(grid.x, grid.y, splits);
+                if (vec) {
+                    gcn_f32_gemm_tn_rb_splitk<true><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc, k_chunk, n_out);
+                } else {
+                    gcn_f32_gemm_tn_rb_splitk<false><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc, k_chunk, n_out);
+                }
+                gcn_f32_splitk_reduce<<<(n_out + 255) / 256, 256, 0, main_stream>>>(part.get(), (float *) dst_ptr, n_out, splits);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+            if (vec) {
+                gcn_f32_gemm_tn_rb<true><<<grid, block, 0, main_stream>>>(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc);
+            } else {
+                gcn_f32_gemm_tn_rb<false><<<grid, block, 0, main_stream>>>(
+                    (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+#endif // defined(GGML_USE_HIP)
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
