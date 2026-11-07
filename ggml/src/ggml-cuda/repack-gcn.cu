@@ -2034,6 +2034,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
     const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
     for (uint32_t u = lane; u < n_unit; u += 64) {
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
@@ -2091,12 +2100,11 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
         uint16_t db[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
-            const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
-            const size_t   idx = (size_t) row * nsp + sb;
+            const size_t idx = row_idx[r] + sb;
             q[r]  = nib[idx];
             h2[r] = reinterpret_cast<const uint2 *>(h2p)[idx];
             sm[r] = smp[idx];
-            db[r] = ddp[(size_t) row * n_super + (sb >> 3)];
+            db[r] = ddp[row_sup[r] + (sb >> 3)];
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -2177,6 +2185,15 @@ static __global__ void mul_mat_vec_q3k_repacked(
 
     float acc[ROWS] = {0.0f, 0.0f};
 
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
     const uint32_t n_unit = HAS_IDS ? n_sub * 2 : n_sub; // see Q4_K note
     for (uint32_t u = lane; u < n_unit; u += 64) {
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
@@ -2200,11 +2217,11 @@ static __global__ void mul_mat_vec_q3k_repacked(
             if (row >= (int) ne1) {
                 continue;
             }
-            const size_t   idx    = (size_t) row * nsp + sb;
+            const size_t   idx    = row_idx[r] + sb;
             const uint2    lo2v   = lo2p[idx];
             const uint32_t qh     = hi1p[idx];
             const uint16_t sm     = smp[idx];
-            const uint16_t d_bits = ddp[(size_t) row * n_super + (sb >> 3)];
+            const uint16_t d_bits = ddp[row_sup[r] + (sb >> 3)];
             const float d = __half2float(*reinterpret_cast<const __half *>(&d_bits));
             const float dsc_lo = d * (float)(int)(int8_t)(sm & 0xFFu);
             const float dsc_hi = d * (float)(int)(int8_t)(sm >> 8);
