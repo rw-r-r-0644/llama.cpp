@@ -895,12 +895,24 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
-            int idot = 0;
-#pragma unroll
-            for (int j = j0; j < j1; j++) {
-                idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (HAS_IDS) {
+                dot0 = ggml_cuda_dp4a((int)( qa[j0]       & 0x0F0F0F0Fu), xq32[j0],         0);
+                dot1 = ggml_cuda_dp4a((int)((qa[j0] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 4],     0);
+                dot2 = ggml_cuda_dp4a((int)( qa[j0+1]       & 0x0F0F0F0Fu), xq32[j0 + 1],     0);
+                dot3 = ggml_cuda_dp4a((int)((qa[j0+1] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 1 + 4], 0);
+            } else {
+                dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
             }
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
         } else {
@@ -928,12 +940,24 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
-            int idot = 0;
-#pragma unroll
-            for (int j = j0; j < j1; j++) {
-                idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (HAS_IDS) {
+                dot0 = ggml_cuda_dp4a((int)( qa[j0]       & 0x0F0F0F0Fu), xq32[j0],         0);
+                dot1 = ggml_cuda_dp4a((int)((qa[j0] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 4],     0);
+                dot2 = ggml_cuda_dp4a((int)( qa[j0+1]       & 0x0F0F0F0Fu), xq32[j0 + 1],     0);
+                dot3 = ggml_cuda_dp4a((int)((qa[j0+1] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 1 + 4], 0);
+            } else {
+                dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
             }
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
         }
@@ -955,7 +979,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
 // Spread 4 bits (b0..b3) to bit 4 of bytes 0..3 — positions the Q5_K
 // high bit above the dp4a nibble lanes.
 static __device__ __forceinline__ uint32_t repack_spread4(const uint32_t h) {
-    return ((h & 1u) << 4) | ((h & 2u) << 11) | ((h & 4u) << 18) | ((h & 8u) << 25);
+    return ((h & 0x0Fu) * 0x02040810u) & 0x10101010u;
 }
 
 // Spread four 2-bit fields (weight b at bits 2b..2b+1) to bits 4..5 of
@@ -1051,14 +1075,37 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
-            int idot = 0;
-#pragma unroll
-            for (int j = j0; j < j1; j++) {
-                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j))     & 0xFu);
-                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j + 4)) & 0xFu);
-                idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
-                idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (HAS_IDS) {
+                const uint32_t lo0 = ( qa[j0]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j0))     & 0xFu);
+                const uint32_t hi0 = ((qa[j0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * j0 + 4)) & 0xFu);
+                const uint32_t lo1 = ( qa[j0+1]       & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * (j0+1)))     & 0xFu);
+                const uint32_t hi1 = ((qa[j0+1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> (8 * (j0+1) + 4)) & 0xFu);
+                dot0 = ggml_cuda_dp4a((int) lo0, xq32[j0],         0);
+                dot1 = ggml_cuda_dp4a((int) hi0, xq32[j0 + 4],     0);
+                dot2 = ggml_cuda_dp4a((int) lo1, xq32[j0 + 1],     0);
+                dot3 = ggml_cuda_dp4a((int) hi1, xq32[j0 + 1 + 4], 0);
+            } else {
+                const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4((qh >> 0)  & 0xFu);
+                const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> 4)  & 0xFu);
+                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4((qh >> 8)  & 0xFu);
+                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> 12) & 0xFu);
+                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4((qh >> 16) & 0xFu);
+                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> 20) & 0xFu);
+                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4((qh >> 24) & 0xFu);
+                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh >> 28) & 0xFu);
+
+                dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
             }
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
         } else {
@@ -1084,14 +1131,37 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             const int j0 = HAS_IDS ? (int)(half * 2) : 0;
             const int j1 = HAS_IDS ? j0 + 2          : 4;
-            int idot = 0;
-#pragma unroll
-            for (int j = j0; j < j1; j++) {
-                const uint32_t lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j))     & 0xFu);
-                const uint32_t hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j + 4)) & 0xFu);
-                idot = ggml_cuda_dp4a((int) lo, xq32[j],     idot);
-                idot = ggml_cuda_dp4a((int) hi, xq32[j + 4], idot);
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (HAS_IDS) {
+                const uint32_t lo0 = ( qa[j0]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j0))     & 0xFu);
+                const uint32_t hi0 = ((qa[j0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * j0 + 4)) & 0xFu);
+                const uint32_t lo1 = ( qa[j0+1]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * (j0+1)))     & 0xFu);
+                const uint32_t hi1 = ((qa[j0+1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> (8 * (j0+1) + 4)) & 0xFu);
+                dot0 = ggml_cuda_dp4a((int) lo0, xq32[j0],         0);
+                dot1 = ggml_cuda_dp4a((int) hi0, xq32[j0 + 4],     0);
+                dot2 = ggml_cuda_dp4a((int) lo1, xq32[j0 + 1],     0);
+                dot3 = ggml_cuda_dp4a((int) hi1, xq32[j0 + 1 + 4], 0);
+            } else {
+                const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 0)  & 0xFu);
+                const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 4)  & 0xFu);
+                const uint32_t lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 8)  & 0xFu);
+                const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 12) & 0xFu);
+                const uint32_t lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 16) & 0xFu);
+                const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 20) & 0xFu);
+                const uint32_t lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 24) & 0xFu);
+                const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh[r] >> 28) & 0xFu);
+
+                dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
             }
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
             acc[r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
         }
         }
@@ -1161,10 +1231,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
         int xqsum = 0;
         if constexpr (MODE == REPACK_NIB_Q4_0) {
-#pragma unroll
-            for (int g = 0; g < 8; g++) {
-                xqsum = ggml_cuda_dp4a(0x01010101, xq32[g], xqsum);
-            }
+            int xs0 = ggml_cuda_dp4a(0x01010101, xq32[0], 0);
+            int xs1 = ggml_cuda_dp4a(0x01010101, xq32[1], 0);
+            int xs2 = ggml_cuda_dp4a(0x01010101, xq32[2], 0);
+            int xs3 = ggml_cuda_dp4a(0x01010101, xq32[3], 0);
+            xs0 = ggml_cuda_dp4a(0x01010101, xq32[4], xs0);
+            xs1 = ggml_cuda_dp4a(0x01010101, xq32[5], xs1);
+            xs2 = ggml_cuda_dp4a(0x01010101, xq32[6], xs2);
+            xs3 = ggml_cuda_dp4a(0x01010101, xq32[7], xs3);
+            xqsum = (xs0 + xs1) + (xs2 + xs3);
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -1177,19 +1252,35 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
             const uint16_t db  = dp[idx];
             const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
             const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-            int idot = 0;
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                if constexpr (MODE == REPACK_NIB_Q4_0) {
-                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
-                } else {
-                    int lo, hi;
-                    repack_nib_decode<MODE>(qa[j], lo, hi);
-                    idot = ggml_cuda_dp4a(lo, xq32[j],     idot);
-                    idot = ggml_cuda_dp4a(hi, xq32[j + 4], idot);
-                }
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (MODE == REPACK_NIB_Q4_0) {
+                dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
+            } else {
+                int lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                repack_nib_decode<MODE>(qa[0], lo0, hi0);
+                repack_nib_decode<MODE>(qa[1], lo1, hi1);
+                repack_nib_decode<MODE>(qa[2], lo2, hi2);
+                repack_nib_decode<MODE>(qa[3], lo3, hi3);
+
+                dot0 = ggml_cuda_dp4a(lo0, xq32[0], 0);
+                dot1 = ggml_cuda_dp4a(hi0, xq32[4], 0);
+                dot2 = ggml_cuda_dp4a(lo1, xq32[1], 0);
+                dot3 = ggml_cuda_dp4a(hi1, xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a(lo2, xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a(hi2, xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a(lo3, xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a(hi3, xq32[7], dot3);
             }
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
             acc[r] += dw * dx * (float) (idot - 8 * xqsum);
         }
     }
@@ -1228,10 +1319,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
         int xqsum = 0;
         if constexpr (MODE == REPACK_NIB_Q4_0) {
-#pragma unroll
-            for (int g = 0; g < 8; g++) {
-                xqsum = ggml_cuda_dp4a(0x01010101, xq32[g], xqsum);
-            }
+            int xs0 = ggml_cuda_dp4a(0x01010101, xq32[0], 0);
+            int xs1 = ggml_cuda_dp4a(0x01010101, xq32[1], 0);
+            int xs2 = ggml_cuda_dp4a(0x01010101, xq32[2], 0);
+            int xs3 = ggml_cuda_dp4a(0x01010101, xq32[3], 0);
+            xs0 = ggml_cuda_dp4a(0x01010101, xq32[4], xs0);
+            xs1 = ggml_cuda_dp4a(0x01010101, xq32[5], xs1);
+            xs2 = ggml_cuda_dp4a(0x01010101, xq32[6], xs2);
+            xs3 = ggml_cuda_dp4a(0x01010101, xq32[7], xs3);
+            xqsum = (xs0 + xs1) + (xs2 + xs3);
         }
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
@@ -1248,19 +1344,35 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
                 const uint16_t db  = dp[idx];
                 const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
                 const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
-                int idot = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    if constexpr (MODE == REPACK_NIB_Q4_0) {
-                        idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                        idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
-                    } else {
-                        int lo, hi;
-                        repack_nib_decode<MODE>(qa[j], lo, hi);
-                        idot = ggml_cuda_dp4a(lo, xq32[j],     idot);
-                        idot = ggml_cuda_dp4a(hi, xq32[j + 4], idot);
-                    }
+                int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+                if constexpr (MODE == REPACK_NIB_Q4_0) {
+                    dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                    dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                    dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                    dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                    dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                    dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
+                } else {
+                    int lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                    repack_nib_decode<MODE>(qa[0], lo0, hi0);
+                    repack_nib_decode<MODE>(qa[1], lo1, hi1);
+                    repack_nib_decode<MODE>(qa[2], lo2, hi2);
+                    repack_nib_decode<MODE>(qa[3], lo3, hi3);
+
+                    dot0 = ggml_cuda_dp4a(lo0, xq32[0], 0);
+                    dot1 = ggml_cuda_dp4a(hi0, xq32[4], 0);
+                    dot2 = ggml_cuda_dp4a(lo1, xq32[1], 0);
+                    dot3 = ggml_cuda_dp4a(hi1, xq32[5], 0);
+
+                    dot0 = ggml_cuda_dp4a(lo2, xq32[2], dot0);
+                    dot1 = ggml_cuda_dp4a(hi2, xq32[6], dot1);
+                    dot2 = ggml_cuda_dp4a(lo3, xq32[3], dot2);
+                    dot3 = ggml_cuda_dp4a(hi3, xq32[7], dot3);
                 }
+                const int idot = (dot0 + dot1) + (dot2 + dot3);
                 acc[w2][r] += dw * dx * (float) (idot - 8 * xqsum);
             }
         }
@@ -2589,13 +2701,24 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
                 const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
                 const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
                 const int j0 = HAS_IDS ? (int)(half * 2) : 0;
-            const int j1 = HAS_IDS ? j0 + 2          : 4;
-                int idot = 0;
-#pragma unroll
-                for (int j = j0; j < j1; j++) {
-                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+                if constexpr (HAS_IDS) {
+                    dot0 = ggml_cuda_dp4a((int)( qa[j0]       & 0x0F0F0F0Fu), xq32[j0],         0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[j0] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 4],     0);
+                    dot2 = ggml_cuda_dp4a((int)( qa[j0+1]       & 0x0F0F0F0Fu), xq32[j0 + 1],     0);
+                    dot3 = ggml_cuda_dp4a((int)((qa[j0+1] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 1 + 4], 0);
+                } else {
+                    dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                    dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                    dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                    dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                    dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                    dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
                 }
+                const int idot = (dot0 + dot1) + (dot2 + dot3);
                 acc[w2][r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
             }
         }
@@ -2630,13 +2753,24 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
                 const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm[w2][r] >> 8);
                 const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
                 const int j0 = HAS_IDS ? (int)(half * 2) : 0;
-                const int j1 = HAS_IDS ? j0 + 2          : 4;
-                int idot = 0;
-#pragma unroll
-                for (int j = j0; j < j1; j++) {
-                    idot = ggml_cuda_dp4a((int)( qa[j]       & 0x0F0F0F0Fu), xq32[j],     idot);
-                    idot = ggml_cuda_dp4a((int)((qa[j] >> 4) & 0x0F0F0F0Fu), xq32[j + 4], idot);
+                int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+                if constexpr (HAS_IDS) {
+                    dot0 = ggml_cuda_dp4a((int)( qa[j0]       & 0x0F0F0F0Fu), xq32[j0],         0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[j0] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 4],     0);
+                    dot2 = ggml_cuda_dp4a((int)( qa[j0+1]       & 0x0F0F0F0Fu), xq32[j0 + 1],     0);
+                    dot3 = ggml_cuda_dp4a((int)((qa[j0+1] >> 4) & 0x0F0F0F0Fu), xq32[j0 + 1 + 4], 0);
+                } else {
+                    dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                    dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                    dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                    dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                    dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                    dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                    dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
                 }
+                const int idot = (dot0 + dot1) + (dot2 + dot3);
                 acc[w2][r] += dsc * dx * (float) idot - (half == 0 ? deff * sx : 0.0f);
             }
         }
