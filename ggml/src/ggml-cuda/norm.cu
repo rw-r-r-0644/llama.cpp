@@ -303,11 +303,16 @@ static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, fl
     const int64_t off = (int64_t) row * ncols;
     a += off; b += off; sum += off; dst += off;
 
+    float xi_cache[8];
+    int n_iter = 0;
     float tmp = 0.0f;
     for (int col = tid; col < ncols; col += block_size) {
         const float xi = a[col] + b[col];
         sum[col] = xi;
         tmp += xi * xi;
+        if (n_iter < 8) {
+            xi_cache[n_iter++] = xi;
+        }
     }
 
     extern __shared__ float s_sum[];
@@ -316,8 +321,10 @@ static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, fl
     const float mean  = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
+    n_iter = 0;
     for (int col = tid; col < ncols; col += block_size) {
-        const float v = scale * sum[col] * mul[col];
+        const float xi = (n_iter < 8) ? xi_cache[n_iter++] : sum[col];
+        const float v = scale * xi * mul[col];
         dst[col] = v;
         if (yq != nullptr) {
             rms_emit_q8_1(yq, off + col, v);
