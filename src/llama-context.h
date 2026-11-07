@@ -310,6 +310,8 @@ private:
 
     const llama_model & model;
 
+    bool is_synchronized = true;
+
     llama_cparams cparams;
 
     llama_adapter_cvec_ptr  cvec;
