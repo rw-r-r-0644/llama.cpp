@@ -822,6 +822,11 @@ static bool q4k_fence() {
     return f;
 }
 
+static bool q5k_fence() {
+    static const bool f = getenv("GGML_CUDA_NO_Q5K_FENCE") == nullptr;
+    return f;
+}
+
 // Repacked Q4_K matvec. Block = 256 threads = 4 wave64s; each wave
 // computes ROWS=2 output rows; lane l streams sub-block l, l+64, ... —
 // consecutive lanes read consecutive 16-byte chunks, a fully-coalesced
@@ -887,12 +892,12 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float2 dx_sx = __half22float2(xb->ds);
-        const float dx = dx_sx.x;
-        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
+            const float2 dx_sx = __half22float2(xb->ds);
+            const float dx = dx_sx.x;
+            const float sx = dx_sx.y;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
@@ -944,6 +949,9 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         if constexpr (FENCE) {
             __builtin_amdgcn_sched_barrier(0);
         }
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
@@ -997,8 +1005,9 @@ static __device__ __forceinline__ uint32_t repack_spread4(const uint32_t h) {
 // Spread four 2-bit fields (weight b at bits 2b..2b+1) to bits 4..5 of
 // bytes 0..3 — the Q6_K quant's high pair.
 static __device__ __forceinline__ uint32_t repack_spread2(const uint32_t h) {
-    return ((h & 0x03u) << 4) | ((h & 0x0Cu) << 10)
-         | ((h & 0x30u) << 16) | ((h & 0xC0u) << 22);
+    const uint32_t even = ((h & 0x33u) * 0x10010u) & 0x00300030u;
+    const uint32_t odd  = (((h & 0xCCu) * 0x1001u) << 10) & 0x30003000u;
+    return even | odd;
 }
 
 // Bytewise v - 32 on four 6-bit values with no borrow between bytes: setting bit 7
@@ -1020,7 +1029,7 @@ static __device__ __forceinline__ uint32_t repack_spread1_hi(const uint32_t h) {
 
 // Q5_K repacked matvec — Q4_K's shape plus the qh plane OR-ed onto the
 // nibbles before each dp4a.
-template <bool HAS_IDS, bool HOIST = true>
+template <bool HAS_IDS, bool FENCE = true, bool HOIST = true>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1073,12 +1082,12 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float2 dx_sx = __half22float2(xb->ds);
-        const float dx = dx_sx.x;
-        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
+            const float2 dx_sx = __half22float2(xb->ds);
+            const float dx = dx_sx.x;
+            const float sx = dx_sx.y;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
@@ -1143,6 +1152,12 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
             sm[r] = smp[idx];
             dd[r] = ddp[row_sup[r] + (sb >> 3)];
         }
+        if constexpr (FENCE) {
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
@@ -1210,6 +1225,12 @@ static __device__ __forceinline__ uint32_t repack_sub8(const uint32_t v) {
     return ((v | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
 }
 
+// bytewise 2*v - 15 on four nibbles without inter-byte borrow: exact IQ3_S codebook without memory lookups
+static __device__ __forceinline__ uint32_t repack_sub15_2x(const uint32_t v) {
+    const uint32_t v2 = v << 1;
+    return ((v2 | 0x80808080u) - 0x0F0F0F0Fu) ^ 0x80808080u;
+}
+
 // IQ3_S values are the odd numbers -15..15: nibble n <-> 2n - 15
 static const __device__ int8_t repack_kvalues_iq3s[16] = { -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15 };
 
@@ -1219,8 +1240,11 @@ static __device__ __forceinline__ void repack_nib_decode(const uint32_t q, int &
     if constexpr (MODE == REPACK_NIB_Q4_0) {
         lo = (int) repack_sub8( q       & 0x0F0F0F0Fu);
         hi = (int) repack_sub8((q >> 4) & 0x0F0F0F0Fu);
+    } else if constexpr (MODE == REPACK_NIB_IQ3S) {
+        lo = (int) repack_sub15_2x( q       & 0x0F0F0F0Fu);
+        hi = (int) repack_sub15_2x((q >> 4) & 0x0F0F0F0Fu);
     } else {
-        const int2 v = get_int_from_table_16((int) q, MODE == REPACK_NIB_IQ4NL ? kvalues_iq4nl : repack_kvalues_iq3s);
+        const int2 v = get_int_from_table_16((int) q, kvalues_iq4nl);
         lo = v.x;
         hi = v.y;
     }
@@ -1254,7 +1278,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
 
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
         int xqsum = 0;
         if constexpr (MODE == REPACK_NIB_Q4_0) {
@@ -1276,6 +1299,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
             q[r]  = nib[idx];
             db[r] = dp[idx];
         }
+        __builtin_amdgcn_sched_barrier(0);
+        const float dx = __low2float(xb->ds);
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[r]));
@@ -1355,7 +1380,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
     float acc[2][ROWS] = {};
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
         int xqsum = 0;
         if constexpr (MODE == REPACK_NIB_Q4_0) {
@@ -1380,6 +1404,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
                 db[w2][r] = dp[w2][idx];
             }
         }
+        __builtin_amdgcn_sched_barrier(0);
+        const float dx = __low2float(xb->ds);
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
 #pragma unroll
@@ -2046,7 +2072,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
         const int hj0 = HAS_IDS ? (int)(half * 2) : 0;
         const int hj1 = HAS_IDS ? hj0 + 2         : 4;
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         // per-half activation sums: the -32 fold splits with them
@@ -2058,6 +2083,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
         }
 
         if constexpr (HAS_IDS || !HOIST) {
+            const float dx = __low2float(xb->ds);
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const int row = row0 + r;
@@ -2102,6 +2128,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
             sm[r] = smp[idx];
             db[r] = ddp[row_sup[r] + (sb >> 3)];
         }
+        __builtin_amdgcn_sched_barrier(0);
+        const float dx = __low2float(xb->ds);
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const uint32_t h2lo = h2[r].x;
@@ -2111,18 +2139,37 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
             const float dsc_hi = d * (float)(int)(int8_t)(sm[r] >> 8);
 
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
-            int idot0 = 0, idot1 = 0;
-#pragma unroll
-            for (int j = hj0; j < hj1; j++) {
-                const uint32_t ge = 2 * j;
-                const uint32_t go = 2 * j + 1;
-                const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
-                const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
-                const uint32_t q6lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he);
-                const uint32_t q6hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho);
-                idot0 = ggml_cuda_dp4a((int) q6lo, xq32[j],     idot0);
-                idot1 = ggml_cuda_dp4a((int) q6hi, xq32[j + 4], idot1);
-            }
+
+            const uint32_t he0 = (h2lo      ) & 0xFFu;
+            const uint32_t ho0 = (h2lo >>  8) & 0xFFu;
+            const uint32_t he1 = (h2lo >> 16) & 0xFFu;
+            const uint32_t ho1 = (h2lo >> 24) & 0xFFu;
+            const uint32_t he2 = (h2hi      ) & 0xFFu;
+            const uint32_t ho2 = (h2hi >>  8) & 0xFFu;
+            const uint32_t he3 = (h2hi >> 16) & 0xFFu;
+            const uint32_t ho3 = (h2hi >> 24) & 0xFFu;
+
+            const uint32_t q6lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread2(he0);
+            const uint32_t q6hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho0);
+            const uint32_t q6lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread2(he1);
+            const uint32_t q6hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho1);
+            const uint32_t q6lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread2(he2);
+            const uint32_t q6hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho2);
+            const uint32_t q6lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread2(he3);
+            const uint32_t q6hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho3);
+
+            int dot0_0 = ggml_cuda_dp4a((int) q6lo0, xq32[0], 0);
+            int dot1_0 = ggml_cuda_dp4a((int) q6hi0, xq32[4], 0);
+            int dot0_1 = ggml_cuda_dp4a((int) q6lo1, xq32[1], 0);
+            int dot1_1 = ggml_cuda_dp4a((int) q6hi1, xq32[5], 0);
+
+            dot0_0 = ggml_cuda_dp4a((int) q6lo2, xq32[2], dot0_0);
+            dot1_0 = ggml_cuda_dp4a((int) q6hi2, xq32[6], dot1_0);
+            dot0_1 = ggml_cuda_dp4a((int) q6lo3, xq32[3], dot0_1);
+            dot1_1 = ggml_cuda_dp4a((int) q6hi3, xq32[7], dot1_1);
+
+            const int idot0 = dot0_0 + dot0_1;
+            const int idot1 = dot1_0 + dot1_1;
             acc[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
                     + dsc_hi * dx * (float)(idot1 - 32 * xis1);
         }
@@ -2740,12 +2787,12 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
         const uint32_t sb   = HAS_IDS ? (u >> 1) : u;
         const uint32_t half = HAS_IDS ? (u & 1)  : 0;
         const block_q8_1 * xb = xq + sb;
-        const float2 dx_sx = __half22float2(xb->ds);
-        const float dx = dx_sx.x;
-        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         if constexpr (HAS_IDS || !HOIST) {
+            const float2 dx_sx = __half22float2(xb->ds);
+            const float dx = dx_sx.x;
+            const float sx = dx_sx.y;
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
             const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
@@ -2808,6 +2855,9 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
         if constexpr (FENCE) {
             __builtin_amdgcn_sched_barrier(0);
         }
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
 #pragma unroll
@@ -2898,9 +2948,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked_glu(
 
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
-        const float2 dx_sx = __half22float2(xb->ds);
-        const float dx = dx_sx.x;
-        const float sx = dx_sx.y;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
 #pragma unroll
@@ -2917,6 +2964,10 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked_glu(
                 sm[r] = smp[w2][idx];
                 dd[r] = ddp[w2][row_sup[r] + (sb >> 3)];
             }
+            __builtin_amdgcn_sched_barrier(0);
+            const float2 dx_sx = __half22float2(xb->ds);
+            const float dx = dx_sx.x;
+            const float sx = dx_sx.y;
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
@@ -2954,6 +3005,681 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked_glu(
     for (int r = 0; r < ROWS; r++) {
         const float up_v   = warp_reduce_sum<64>(acc[0][r]);
         const float gate_v = warp_reduce_sum<64>(acc[1][r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Mixed Q5_K / Q4_K dense gate+up GLU kernel: walks both weight slabs (one Q5_K, one Q4_K)
+// in one sub-block loop with single-pass activation reading and writes y[row] = glu(gate) * up.
+template <bool UP_IS_Q5K, bool GATE_IS_Q5K, int ROWS = 2>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_q4k_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const size_t qh_offset = (size_t) ne1 * nsp * 16;
+    const size_t sm_offset_q5k = qh_offset + (size_t) ne1 * nsp * 4;
+    const size_t dd_offset_q5k = sm_offset_q5k + (size_t) ne1 * nsp * 2;
+
+    const size_t sm_offset_q4k = (size_t) ne1 * nsp * 16;
+    const size_t dd_offset_q4k = sm_offset_q4k + (size_t) ne1 * nsp * 2;
+
+    const uint4    * nib[2] = { reinterpret_cast<const uint4 *>(wup), reinterpret_cast<const uint4 *>(wgate) };
+    const uint32_t * qhp[2] = {
+        UP_IS_Q5K   ? reinterpret_cast<const uint32_t *>(wup   + qh_offset) : nullptr,
+        GATE_IS_Q5K ? reinterpret_cast<const uint32_t *>(wgate + qh_offset) : nullptr
+    };
+    const uint16_t * smp[2] = {
+        UP_IS_Q5K   ? reinterpret_cast<const uint16_t *>(wup   + sm_offset_q5k) : reinterpret_cast<const uint16_t *>(wup   + sm_offset_q4k),
+        GATE_IS_Q5K ? reinterpret_cast<const uint16_t *>(wgate + sm_offset_q5k) : reinterpret_cast<const uint16_t *>(wgate + sm_offset_q4k)
+    };
+    const uint32_t * ddp[2] = {
+        UP_IS_Q5K   ? reinterpret_cast<const uint32_t *>(wup   + dd_offset_q5k) : reinterpret_cast<const uint32_t *>(wup   + dd_offset_q4k),
+        GATE_IS_Q5K ? reinterpret_cast<const uint32_t *>(wgate + dd_offset_q5k) : reinterpret_cast<const uint32_t *>(wgate + dd_offset_q4k)
+    };
+
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
+    float acc[2][ROWS] = {};
+
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const bool is_q5k = (w2 == 0) ? UP_IS_Q5K : GATE_IS_Q5K;
+            uint4    q[ROWS];
+            uint32_t qh[ROWS];
+            uint16_t sm[ROWS];
+            uint32_t dd[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const size_t idx = row_idx[r] + sb;
+                q[r]  = nib[w2][idx];
+                qh[r] = is_q5k ? qhp[w2][idx] : 0u;
+                sm[r] = smp[w2][idx];
+                dd[r] = ddp[w2][row_sup[r] + (sb >> 3)];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
+                const float dsc  = d_dmin.x * (float)(sm[r] & 0xFFu);
+                const float deff = d_dmin.y * (float)(sm[r] >> 8);
+                const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+
+                uint32_t lo0 = qa[0]       & 0x0F0F0F0Fu;
+                uint32_t hi0 = (qa[0] >> 4) & 0x0F0F0F0Fu;
+                uint32_t lo1 = qa[1]       & 0x0F0F0F0Fu;
+                uint32_t hi1 = (qa[1] >> 4) & 0x0F0F0F0Fu;
+                uint32_t lo2 = qa[2]       & 0x0F0F0F0Fu;
+                uint32_t hi2 = (qa[2] >> 4) & 0x0F0F0F0Fu;
+                uint32_t lo3 = qa[3]       & 0x0F0F0F0Fu;
+                uint32_t hi3 = (qa[3] >> 4) & 0x0F0F0F0Fu;
+
+                if (is_q5k) {
+                    lo0 |= repack_spread4(qh[r] >> 0);
+                    hi0 |= repack_spread4(qh[r] >> 4);
+                    lo1 |= repack_spread4(qh[r] >> 8);
+                    hi1 |= repack_spread4(qh[r] >> 12);
+                    lo2 |= repack_spread4(qh[r] >> 16);
+                    hi2 |= repack_spread4(qh[r] >> 20);
+                    lo3 |= repack_spread4(qh[r] >> 24);
+                    hi3 |= repack_spread4(qh[r] >> 28);
+                }
+
+                int dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
+                int dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+                int dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
+                int dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
+
+                const int idot = (dot0 + dot1) + (dot2 + dot3);
+                acc[w2][r] += dsc * dx * (float) idot - deff * sx;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_v   = warp_reduce_sum<64>(acc[0][r]);
+        const float gate_v = warp_reduce_sum<64>(acc[1][r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Mixed Q5_K/Q4_K and NIB (IQ4_XS / IQ4_NL / Q4_0) dense GLU kernel.
+// Evaluates both weight slabs in a single sub-block loop with shared activation reads.
+template <bool UP_IS_NIB, bool QKX_IS_Q5K, int MODE = REPACK_NIB_IQ4NL, int ROWS = 2>
+static __global__ void __launch_bounds__(256) mul_mat_vec_qkx_nib_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint8_t * w_qkx = UP_IS_NIB ? wgate : wup;
+    const uint8_t * w_nib = UP_IS_NIB ? wup   : wgate;
+
+    const size_t qh_offset = (size_t) ne1 * nsp * 16;
+    const size_t sm_offset_q5k = qh_offset + (size_t) ne1 * nsp * 4;
+    const size_t dd_offset_q5k = sm_offset_q5k + (size_t) ne1 * nsp * 2;
+
+    const size_t sm_offset_q4k = (size_t) ne1 * nsp * 16;
+    const size_t dd_offset_q4k = sm_offset_q4k + (size_t) ne1 * nsp * 2;
+
+    const uint4    * qkx_nib = reinterpret_cast<const uint4 *>(w_qkx);
+    const uint32_t * qkx_qhp = QKX_IS_Q5K ? reinterpret_cast<const uint32_t *>(w_qkx + qh_offset) : nullptr;
+    const uint16_t * qkx_smp = reinterpret_cast<const uint16_t *>(w_qkx + (QKX_IS_Q5K ? sm_offset_q5k : sm_offset_q4k));
+    const uint32_t * qkx_ddp = reinterpret_cast<const uint32_t *>(w_qkx + (QKX_IS_Q5K ? dd_offset_q5k : dd_offset_q4k));
+
+    const uint4    * nib_nib = reinterpret_cast<const uint4 *>(w_nib);
+    const uint16_t * nib_dp  = reinterpret_cast<const uint16_t *>(w_nib + (size_t) ne1 * nsp * 16);
+
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
+    float acc_qkx[ROWS] = {};
+    float acc_nib[ROWS] = {};
+
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+        // --- Evaluate QKX slab ---
+        uint4    q_qkx[ROWS];
+        uint32_t qh_qkx[ROWS];
+        uint16_t sm_qkx[ROWS];
+        uint32_t dd_qkx[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_qkx[r]  = qkx_nib[idx];
+            qh_qkx[r] = QKX_IS_Q5K ? qkx_qhp[idx] : 0u;
+            sm_qkx[r] = qkx_smp[idx];
+            dd_qkx[r] = qkx_ddp[row_sup[r] + (sb >> 3)];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd_qkx[r]));
+            const float dsc  = d_dmin.x * (float)(sm_qkx[r] & 0xFFu);
+            const float deff = d_dmin.y * (float)(sm_qkx[r] >> 8);
+            const uint32_t qa[4] = { q_qkx[r].x, q_qkx[r].y, q_qkx[r].z, q_qkx[r].w };
+
+            uint32_t lo0 = qa[0]       & 0x0F0F0F0Fu;
+            uint32_t hi0 = (qa[0] >> 4) & 0x0F0F0F0Fu;
+            uint32_t lo1 = qa[1]       & 0x0F0F0F0Fu;
+            uint32_t hi1 = (qa[1] >> 4) & 0x0F0F0F0Fu;
+            uint32_t lo2 = qa[2]       & 0x0F0F0F0Fu;
+            uint32_t hi2 = (qa[2] >> 4) & 0x0F0F0F0Fu;
+            uint32_t lo3 = qa[3]       & 0x0F0F0F0Fu;
+            uint32_t hi3 = (qa[3] >> 4) & 0x0F0F0F0Fu;
+
+            if constexpr (QKX_IS_Q5K) {
+                lo0 |= repack_spread4(qh_qkx[r] >> 0);
+                hi0 |= repack_spread4(qh_qkx[r] >> 4);
+                lo1 |= repack_spread4(qh_qkx[r] >> 8);
+                hi1 |= repack_spread4(qh_qkx[r] >> 12);
+                lo2 |= repack_spread4(qh_qkx[r] >> 16);
+                hi2 |= repack_spread4(qh_qkx[r] >> 20);
+                lo3 |= repack_spread4(qh_qkx[r] >> 24);
+                hi3 |= repack_spread4(qh_qkx[r] >> 28);
+            }
+
+            int dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
+            int dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+            int dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
+            int dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
+
+            dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
+            dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+            dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
+            dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
+
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
+            acc_qkx[r] += dsc * dx * (float) idot - deff * sx;
+        }
+
+        // --- Evaluate NIB slab ---
+        uint4    q_nib[ROWS];
+        uint16_t dp_nib[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_nib[r]  = nib_nib[idx];
+            dp_nib[r] = nib_dp[idx];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const float dw = __half2float(*reinterpret_cast<const __half *>(&dp_nib[r]));
+            const uint32_t qa[4] = { q_nib[r].x, q_nib[r].y, q_nib[r].z, q_nib[r].w };
+            int lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+            repack_nib_decode<MODE>(qa[0], lo0, hi0);
+            repack_nib_decode<MODE>(qa[1], lo1, hi1);
+            repack_nib_decode<MODE>(qa[2], lo2, hi2);
+            repack_nib_decode<MODE>(qa[3], lo3, hi3);
+
+            int dot0 = ggml_cuda_dp4a(lo0, xq32[0], 0);
+            int dot1 = ggml_cuda_dp4a(hi0, xq32[4], 0);
+            int dot2 = ggml_cuda_dp4a(lo1, xq32[1], 0);
+            int dot3 = ggml_cuda_dp4a(hi1, xq32[5], 0);
+
+            dot0 = ggml_cuda_dp4a(lo2, xq32[2], dot0);
+            dot1 = ggml_cuda_dp4a(hi2, xq32[6], dot1);
+            dot2 = ggml_cuda_dp4a(lo3, xq32[3], dot2);
+            dot3 = ggml_cuda_dp4a(hi3, xq32[7], dot3);
+
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
+            acc_nib[r] += dw * dx * (float) idot;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float v_qkx = warp_reduce_sum<64>(acc_qkx[r]);
+        const float v_nib = warp_reduce_sum<64>(acc_nib[r]);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float up_v   = UP_IS_NIB ? v_nib : v_qkx;
+            const float gate_v = UP_IS_NIB ? v_qkx : v_nib;
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Mixed Q6_K / Q5_K dense GLU kernel. Walks both slabs in one sub-block loop
+// with shared activation reads. Specifying __launch_bounds__(256, 4) enforces
+// VGPR <= 64 for 4 waves/SIMD occupancy on gfx906.
+template <bool UP_IS_Q6K, bool GATE_IS_Q6K, int ROWS = 2>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_q5k_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint8_t * w_q6k = UP_IS_Q6K ? wup : wgate;
+    const uint8_t * w_q5k = UP_IS_Q6K ? wgate : wup;
+
+    // Q6_K offsets
+    const size_t h2_offset = (size_t) ne1 * nsp * 16;
+    const size_t sm_offset_q6k = h2_offset + (size_t) ne1 * nsp * 8;
+    const size_t dd_offset_q6k = sm_offset_q6k + (size_t) ne1 * nsp * 2;
+
+    const uint4    * nib_q6k = reinterpret_cast<const uint4 *>(w_q6k);
+    const uint32_t * h2p_q6k = reinterpret_cast<const uint32_t *>(w_q6k + h2_offset);
+    const uint16_t * smp_q6k = reinterpret_cast<const uint16_t *>(w_q6k + sm_offset_q6k);
+    const uint16_t * ddp_q6k = reinterpret_cast<const uint16_t *>(w_q6k + dd_offset_q6k);
+
+    // Q5_K offsets
+    const size_t qh_offset = (size_t) ne1 * nsp * 16;
+    const size_t sm_offset_q5k = qh_offset + (size_t) ne1 * nsp * 4;
+    const size_t dd_offset_q5k = sm_offset_q5k + (size_t) ne1 * nsp * 2;
+
+    const uint4    * nib_q5k = reinterpret_cast<const uint4 *>(w_q5k);
+    const uint32_t * qhp_q5k = reinterpret_cast<const uint32_t *>(w_q5k + qh_offset);
+    const uint16_t * smp_q5k = reinterpret_cast<const uint16_t *>(w_q5k + sm_offset_q5k);
+    const uint32_t * ddp_q5k = reinterpret_cast<const uint32_t *>(w_q5k + dd_offset_q5k);
+
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
+    float acc_q6k[ROWS] = {0.0f, 0.0f};
+    float acc_q5k[ROWS] = {0.0f, 0.0f};
+
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+        // activation sums for Q6_K -32 fold
+        int xis0 = ggml_cuda_dp4a(xq32[0], 0x01010101, 0);
+        int xis1 = ggml_cuda_dp4a(xq32[4], 0x01010101, 0);
+        xis0 = ggml_cuda_dp4a(xq32[1], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[5], 0x01010101, xis1);
+        xis0 = ggml_cuda_dp4a(xq32[2], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[6], 0x01010101, xis1);
+        xis0 = ggml_cuda_dp4a(xq32[3], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[7], 0x01010101, xis1);
+
+        // --- Evaluate Q6_K slab ---
+        uint4    q_6k[ROWS];
+        uint2    h2_6k[ROWS];
+        uint16_t sm_6k[ROWS];
+        uint16_t db_6k[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_6k[r]  = nib_q6k[idx];
+            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[idx];
+            sm_6k[r] = smp_q6k[idx];
+            db_6k[r] = ddp_q6k[row_sup[r] + (sb >> 3)];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const uint32_t h2lo = h2_6k[r].x;
+            const uint32_t h2hi = h2_6k[r].y;
+            const float d = __half2float(*reinterpret_cast<const __half *>(&db_6k[r]));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm_6k[r] & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm_6k[r] >> 8);
+
+            const uint32_t qa[4] = { q_6k[r].x, q_6k[r].y, q_6k[r].z, q_6k[r].w };
+
+            const uint32_t he0 = (h2lo      ) & 0xFFu;
+            const uint32_t ho0 = (h2lo >>  8) & 0xFFu;
+            const uint32_t he1 = (h2lo >> 16) & 0xFFu;
+            const uint32_t ho1 = (h2lo >> 24) & 0xFFu;
+            const uint32_t he2 = (h2hi      ) & 0xFFu;
+            const uint32_t ho2 = (h2hi >>  8) & 0xFFu;
+            const uint32_t he3 = (h2hi >> 16) & 0xFFu;
+            const uint32_t ho3 = (h2hi >> 24) & 0xFFu;
+
+            const uint32_t q6lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread2(he0);
+            const uint32_t q6hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho0);
+            const uint32_t q6lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread2(he1);
+            const uint32_t q6hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho1);
+            const uint32_t q6lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread2(he2);
+            const uint32_t q6hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho2);
+            const uint32_t q6lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread2(he3);
+            const uint32_t q6hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho3);
+
+            int dot0_0 = ggml_cuda_dp4a((int) q6lo0, xq32[0], 0);
+            int dot1_0 = ggml_cuda_dp4a((int) q6hi0, xq32[4], 0);
+            int dot0_1 = ggml_cuda_dp4a((int) q6lo1, xq32[1], 0);
+            int dot1_1 = ggml_cuda_dp4a((int) q6hi1, xq32[5], 0);
+
+            dot0_0 = ggml_cuda_dp4a((int) q6lo2, xq32[2], dot0_0);
+            dot1_0 = ggml_cuda_dp4a((int) q6hi2, xq32[6], dot1_0);
+            dot0_1 = ggml_cuda_dp4a((int) q6lo3, xq32[3], dot0_1);
+            dot1_1 = ggml_cuda_dp4a((int) q6hi3, xq32[7], dot1_1);
+
+            const int idot0 = dot0_0 + dot0_1;
+            const int idot1 = dot1_0 + dot1_1;
+            acc_q6k[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
+                        + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+        }
+
+        // --- Evaluate Q5_K slab ---
+        uint4    q_5k[ROWS];
+        uint32_t qh_5k[ROWS];
+        uint16_t sm_5k[ROWS];
+        uint32_t dd_5k[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_5k[r]  = nib_q5k[idx];
+            qh_5k[r] = qhp_q5k[idx];
+            sm_5k[r] = smp_q5k[idx];
+            dd_5k[r] = ddp_q5k[row_sup[r] + (sb >> 3)];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd_5k[r]));
+            const float dsc  = d_dmin.x * (float)(sm_5k[r] & 0xFFu);
+            const float deff = d_dmin.y * (float)(sm_5k[r] >> 8);
+            const uint32_t qa[4] = { q_5k[r].x, q_5k[r].y, q_5k[r].z, q_5k[r].w };
+
+            const uint32_t lo0 = (qa[0]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  0) & 0xFu);
+            const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  4) & 0xFu);
+            const uint32_t lo1 = (qa[1]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  8) & 0xFu);
+            const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 12) & 0xFu);
+            const uint32_t lo2 = (qa[2]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 16) & 0xFu);
+            const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 20) & 0xFu);
+            const uint32_t lo3 = (qa[3]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 24) & 0xFu);
+            const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 28) & 0xFu);
+
+            int dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
+            int dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
+            int dot2 = ggml_cuda_dp4a((int) lo1, xq32[1], 0);
+            int dot3 = ggml_cuda_dp4a((int) hi1, xq32[5], 0);
+
+            dot0 = ggml_cuda_dp4a((int) lo2, xq32[2], dot0);
+            dot1 = ggml_cuda_dp4a((int) hi2, xq32[6], dot1);
+            dot2 = ggml_cuda_dp4a((int) lo3, xq32[3], dot2);
+            dot3 = ggml_cuda_dp4a((int) hi3, xq32[7], dot3);
+
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
+            acc_q5k[r] += dsc * dx * (float) idot - deff * sx;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_acc   = UP_IS_Q6K ? acc_q6k[r] : acc_q5k[r];
+        const float gate_acc = UP_IS_Q6K ? acc_q5k[r] : acc_q6k[r];
+        const float up_v   = warp_reduce_sum<64>(up_acc);
+        const float gate_v = warp_reduce_sum<64>(gate_acc);
+        if (lane == 0 && (row0 + r) < (int) ne1) {
+            const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
+                ? ggml_cuda_op_silu_single(gate_v)
+                : ggml_cuda_op_gelu_single(gate_v);
+            y[row0 + r] = g * up_v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne0, ne1, glu_op);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
+// Mixed Q6_K / NIB dense GLU kernel. Evaluates both weight slabs in a single
+// sub-block loop with shared activation reads.
+template <bool UP_IS_Q6K, int MODE = REPACK_NIB_IQ4NL, int ROWS = 2>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_nib_repacked_glu(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const int glu_op) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    const int wave = threadIdx.x >> 6;
+    const int lane = threadIdx.x & 63;
+    const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
+    const uint32_t n_sub = ne0 >> 5;
+    const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    const uint32_t n_super = n_sub >> 3;
+
+    const uint8_t * w_q6k = UP_IS_Q6K ? wup   : wgate;
+    const uint8_t * w_nib = UP_IS_Q6K ? wgate : wup;
+
+    // Q6_K planes
+    const size_t h2_offset = (size_t) ne1 * nsp * 16;
+    const size_t sm_offset_q6k = h2_offset + (size_t) ne1 * nsp * 8;
+    const size_t dd_offset_q6k = sm_offset_q6k + (size_t) ne1 * nsp * 2;
+
+    const uint4    * nib_q6k = reinterpret_cast<const uint4 *>(w_q6k);
+    const uint32_t * h2p_q6k = reinterpret_cast<const uint32_t *>(w_q6k + h2_offset);
+    const uint16_t * smp_q6k = reinterpret_cast<const uint16_t *>(w_q6k + sm_offset_q6k);
+    const uint16_t * ddp_q6k = reinterpret_cast<const uint16_t *>(w_q6k + dd_offset_q6k);
+
+    // NIB planes
+    const uint4    * nib_nib  = reinterpret_cast<const uint4 *>(w_nib);
+    const uint16_t * nib_dp   = reinterpret_cast<const uint16_t *>(w_nib + (size_t) ne1 * nsp * 16);
+
+    size_t row_idx[ROWS];
+    size_t row_sup[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const uint32_t row = (uint32_t) min(row0 + r, (int) ne1 - 1);
+        row_idx[r] = (size_t) row * nsp;
+        row_sup[r] = (size_t) row * n_super;
+    }
+
+    float acc_q6k[ROWS] = {0.0f, 0.0f};
+    float acc_nib[ROWS] = {0.0f, 0.0f};
+
+    for (uint32_t sb = lane; sb < n_sub; sb += 64) {
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const int * xq32 = reinterpret_cast<const int *>(xb->qs);
+
+        // activation sums for Q6_K -32 fold
+        int xis0 = ggml_cuda_dp4a(xq32[0], 0x01010101, 0);
+        int xis1 = ggml_cuda_dp4a(xq32[4], 0x01010101, 0);
+        xis0 = ggml_cuda_dp4a(xq32[1], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[5], 0x01010101, xis1);
+        xis0 = ggml_cuda_dp4a(xq32[2], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[6], 0x01010101, xis1);
+        xis0 = ggml_cuda_dp4a(xq32[3], 0x01010101, xis0);
+        xis1 = ggml_cuda_dp4a(xq32[7], 0x01010101, xis1);
+
+        int xqsum = 0;
+        if constexpr (MODE == REPACK_NIB_Q4_0) {
+            xqsum = (xis0 + xis1);
+        }
+
+        // --- Evaluate Q6_K slab ---
+        uint4    q_6k[ROWS];
+        uint2    h2_6k[ROWS];
+        uint16_t sm_6k[ROWS];
+        uint16_t db_6k[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_6k[r]  = nib_q6k[idx];
+            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[idx];
+            sm_6k[r] = smp_q6k[idx];
+            db_6k[r] = ddp_q6k[row_sup[r] + (sb >> 3)];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const uint32_t h2lo = h2_6k[r].x;
+            const uint32_t h2hi = h2_6k[r].y;
+            const float d = __half2float(*reinterpret_cast<const __half *>(&db_6k[r]));
+            const float dsc_lo = d * (float)(int)(int8_t)(sm_6k[r] & 0xFFu);
+            const float dsc_hi = d * (float)(int)(int8_t)(sm_6k[r] >> 8);
+
+            const uint32_t qa[4] = { q_6k[r].x, q_6k[r].y, q_6k[r].z, q_6k[r].w };
+
+            const uint32_t he0 = (h2lo      ) & 0xFFu;
+            const uint32_t ho0 = (h2lo >>  8) & 0xFFu;
+            const uint32_t he1 = (h2lo >> 16) & 0xFFu;
+            const uint32_t ho1 = (h2lo >> 24) & 0xFFu;
+            const uint32_t he2 = (h2hi      ) & 0xFFu;
+            const uint32_t ho2 = (h2hi >>  8) & 0xFFu;
+            const uint32_t he3 = (h2hi >> 16) & 0xFFu;
+            const uint32_t ho3 = (h2hi >> 24) & 0xFFu;
+
+            const uint32_t q6lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread2(he0);
+            const uint32_t q6hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho0);
+            const uint32_t q6lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread2(he1);
+            const uint32_t q6hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho1);
+            const uint32_t q6lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread2(he2);
+            const uint32_t q6hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho2);
+            const uint32_t q6lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread2(he3);
+            const uint32_t q6hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho3);
+
+            int dot0_0 = ggml_cuda_dp4a((int) q6lo0, xq32[0], 0);
+            int dot1_0 = ggml_cuda_dp4a((int) q6hi0, xq32[4], 0);
+            int dot0_1 = ggml_cuda_dp4a((int) q6lo1, xq32[1], 0);
+            int dot1_1 = ggml_cuda_dp4a((int) q6hi1, xq32[5], 0);
+
+            dot0_0 = ggml_cuda_dp4a((int) q6lo2, xq32[2], dot0_0);
+            dot1_0 = ggml_cuda_dp4a((int) q6hi2, xq32[6], dot1_0);
+            dot0_1 = ggml_cuda_dp4a((int) q6lo3, xq32[3], dot0_1);
+            dot1_1 = ggml_cuda_dp4a((int) q6hi3, xq32[7], dot1_1);
+
+            const int idot0 = dot0_0 + dot0_1;
+            const int idot1 = dot1_0 + dot1_1;
+            acc_q6k[r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
+                        + dsc_hi * dx * (float)(idot1 - 32 * xis1);
+        }
+
+        // --- Evaluate NIB slab ---
+        uint4    q_nib[ROWS];
+        uint16_t dp_nib[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const size_t idx = row_idx[r] + sb;
+            q_nib[r]  = nib_nib[idx];
+            dp_nib[r] = nib_dp[idx];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            const float dw = __half2float(*reinterpret_cast<const __half *>(&dp_nib[r]));
+            const uint32_t qa[4] = { q_nib[r].x, q_nib[r].y, q_nib[r].z, q_nib[r].w };
+            int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
+            if constexpr (MODE == REPACK_NIB_Q4_0) {
+                dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
+                dot1 = ggml_cuda_dp4a((int)((qa[0] >> 4) & 0x0F0F0F0Fu), xq32[4], 0);
+                dot2 = ggml_cuda_dp4a((int)( qa[1]       & 0x0F0F0F0Fu), xq32[1], 0);
+                dot3 = ggml_cuda_dp4a((int)((qa[1] >> 4) & 0x0F0F0F0Fu), xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a((int)( qa[2]       & 0x0F0F0F0Fu), xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a((int)((qa[2] >> 4) & 0x0F0F0F0Fu), xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a((int)( qa[3]       & 0x0F0F0F0Fu), xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a((int)((qa[3] >> 4) & 0x0F0F0F0Fu), xq32[7], dot3);
+            } else {
+                int lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                repack_nib_decode<MODE>(qa[0], lo0, hi0);
+                repack_nib_decode<MODE>(qa[1], lo1, hi1);
+                repack_nib_decode<MODE>(qa[2], lo2, hi2);
+                repack_nib_decode<MODE>(qa[3], lo3, hi3);
+
+                dot0 = ggml_cuda_dp4a(lo0, xq32[0], 0);
+                dot1 = ggml_cuda_dp4a(hi0, xq32[4], 0);
+                dot2 = ggml_cuda_dp4a(lo1, xq32[1], 0);
+                dot3 = ggml_cuda_dp4a(hi1, xq32[5], 0);
+
+                dot0 = ggml_cuda_dp4a(lo2, xq32[2], dot0);
+                dot1 = ggml_cuda_dp4a(hi2, xq32[6], dot1);
+                dot2 = ggml_cuda_dp4a(lo3, xq32[3], dot2);
+                dot3 = ggml_cuda_dp4a(hi3, xq32[7], dot3);
+            }
+
+            const int idot = (dot0 + dot1) + (dot2 + dot3);
+            if constexpr (MODE == REPACK_NIB_Q4_0) {
+                acc_nib[r] += dw * dx * (float)(idot - 8 * xqsum);
+            } else {
+                acc_nib[r] += dw * dx * (float) idot;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        const float up_acc   = UP_IS_Q6K ? acc_q6k[r] : acc_nib[r];
+        const float gate_acc = UP_IS_Q6K ? acc_nib[r] : acc_q6k[r];
+        const float up_v   = warp_reduce_sum<64>(up_acc);
+        const float gate_v = warp_reduce_sum<64>(gate_acc);
         if (lane == 0 && (row0 + r) < (int) ne1) {
             const float g = glu_op == (int) GGML_GLU_OP_SWIGLU
                 ? ggml_cuda_op_silu_single(gate_v)
@@ -3005,7 +3731,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked_glu(
 
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
-        const float dx = __low2float(xb->ds);
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
         // activation sums: -32 fold against integer sums, computed once per sub-block!
@@ -3030,6 +3755,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked_glu(
                 sm[r] = smp[w2][idx];
                 db[r] = ddp[w2][row_sup[r] + (sb >> 3)];
             }
+            __builtin_amdgcn_sched_barrier(0);
+            const float dx = __low2float(xb->ds);
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 const uint32_t h2lo = h2[r].x;
@@ -3039,18 +3766,37 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked_glu(
                 const float dsc_hi = d * (float)(int)(int8_t)(sm[r] >> 8);
 
                 const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
-                int idot0 = 0, idot1 = 0;
-#pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const uint32_t ge = 2 * j;
-                    const uint32_t go = 2 * j + 1;
-                    const uint32_t he = ((ge < 4 ? h2lo : h2hi) >> (8 * (ge & 3))) & 0xFFu;
-                    const uint32_t ho = ((go < 4 ? h2lo : h2hi) >> (8 * (go & 3))) & 0xFFu;
-                    const uint32_t q6lo = ( qa[j]       & 0x0F0F0F0Fu) | repack_spread2(he);
-                    const uint32_t q6hi = ((qa[j] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho);
-                    idot0 = ggml_cuda_dp4a((int) q6lo, xq32[j],     idot0);
-                    idot1 = ggml_cuda_dp4a((int) q6hi, xq32[j + 4], idot1);
-                }
+
+                const uint32_t he0 = (h2lo      ) & 0xFFu;
+                const uint32_t ho0 = (h2lo >>  8) & 0xFFu;
+                const uint32_t he1 = (h2lo >> 16) & 0xFFu;
+                const uint32_t ho1 = (h2lo >> 24) & 0xFFu;
+                const uint32_t he2 = (h2hi      ) & 0xFFu;
+                const uint32_t ho2 = (h2hi >>  8) & 0xFFu;
+                const uint32_t he3 = (h2hi >> 16) & 0xFFu;
+                const uint32_t ho3 = (h2hi >> 24) & 0xFFu;
+
+                const uint32_t q6lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread2(he0);
+                const uint32_t q6hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho0);
+                const uint32_t q6lo1 = ( qa[1]       & 0x0F0F0F0Fu) | repack_spread2(he1);
+                const uint32_t q6hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho1);
+                const uint32_t q6lo2 = ( qa[2]       & 0x0F0F0F0Fu) | repack_spread2(he2);
+                const uint32_t q6hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho2);
+                const uint32_t q6lo3 = ( qa[3]       & 0x0F0F0F0Fu) | repack_spread2(he3);
+                const uint32_t q6hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread2(ho3);
+
+                int dot0_0 = ggml_cuda_dp4a((int) q6lo0, xq32[0], 0);
+                int dot1_0 = ggml_cuda_dp4a((int) q6hi0, xq32[4], 0);
+                int dot0_1 = ggml_cuda_dp4a((int) q6lo1, xq32[1], 0);
+                int dot1_1 = ggml_cuda_dp4a((int) q6hi1, xq32[5], 0);
+
+                dot0_0 = ggml_cuda_dp4a((int) q6lo2, xq32[2], dot0_0);
+                dot1_0 = ggml_cuda_dp4a((int) q6hi2, xq32[6], dot1_0);
+                dot0_1 = ggml_cuda_dp4a((int) q6lo3, xq32[3], dot0_1);
+                dot1_1 = ggml_cuda_dp4a((int) q6hi3, xq32[7], dot1_1);
+
+                const int idot0 = dot0_0 + dot0_1;
+                const int idot1 = dot1_0 + dot1_1;
                 acc[w2][r] += dsc_lo * dx * (float)(idot0 - 32 * xis0)
                             + dsc_hi * dx * (float)(idot1 - 32 * xis1);
             }
@@ -5769,8 +6515,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                if (kq_hoist()) {
-                    mul_mat_vec_q5k_repacked<false><<<grid, 256, 0, stream>>>(
+                if (!kq_hoist()) {
+                    mul_mat_vec_q5k_repacked<false, false, false><<<grid, 256, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
+                } else if (q5k_fence()) {
+                    mul_mat_vec_q5k_repacked<false, true><<<grid, 256, 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, nullptr, nullptr, nullptr, 0, 0, 0, 0);
                 } else {
                     mul_mat_vec_q5k_repacked<false, false><<<grid, 256, 0, stream>>>(
@@ -6460,6 +7209,16 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     }
 }
 
+static inline bool is_repack_nib_type(ggml_type t) {
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_IQ4_XS || t == GGML_TYPE_IQ3_S;
+}
+
+static inline int repack_nib_mode(ggml_type t) {
+    if (t == GGML_TYPE_Q4_0) return REPACK_NIB_Q4_0;
+    if (t == GGML_TYPE_IQ3_S) return REPACK_NIB_IQ3S;
+    return REPACK_NIB_IQ4NL;
+}
+
 // Eligibility for the fused gate+up GLU path: both weights in the
 // repack buffer type, Q4_K, identical shape; decode only (one output
 // column per expert slot); SWIGLU or GEGLU.
@@ -6472,14 +7231,29 @@ bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor 
         !ggml_backend_buft_is_cuda_repack(wg->buffer->buft)) {
         return false;
     }
-    if (wu->type != wg->type || !ggml_are_same_shape(wu, wg)) {
+    if (!ggml_are_same_shape(wu, wg)) {
         return false;
     }
-    // Q8_0 / Q4_0 / IQ family / Q5_K / Q6_K: dense decode only
-    const bool dense_only = wu->type == GGML_TYPE_Q8_0 || wu->type == GGML_TYPE_Q4_0 || wu->type == GGML_TYPE_IQ4_NL ||
-                            wu->type == GGML_TYPE_IQ4_XS || wu->type == GGML_TYPE_IQ3_S || wu->type == GGML_TYPE_Q5_K ||
-                            wu->type == GGML_TYPE_Q6_K;
-    if (wu->type != GGML_TYPE_Q4_K && !(dense_only && up->src[2] == nullptr)) {
+    const ggml_type eff_u = repack_eff_type(wu->type);
+    const ggml_type eff_g = repack_eff_type(wg->type);
+
+    const bool is_mixed_q5k_q4k = (eff_u == GGML_TYPE_Q5_K && eff_g == GGML_TYPE_Q4_K) ||
+                                  (eff_u == GGML_TYPE_Q4_K && eff_g == GGML_TYPE_Q5_K);
+    const bool is_mixed_q6k_q5k = (eff_u == GGML_TYPE_Q6_K && eff_g == GGML_TYPE_Q5_K) ||
+                                  (eff_u == GGML_TYPE_Q5_K && eff_g == GGML_TYPE_Q6_K);
+    const bool is_nib_nib       = is_repack_nib_type(eff_u) && is_repack_nib_type(eff_g);
+    const bool is_mixed_qkx_nib = ((eff_u == GGML_TYPE_Q5_K || eff_u == GGML_TYPE_Q4_K) && is_repack_nib_type(eff_g)) ||
+                                  (is_repack_nib_type(eff_u) && (eff_g == GGML_TYPE_Q5_K || eff_g == GGML_TYPE_Q4_K));
+    const bool is_mixed_q6k_nib = (eff_u == GGML_TYPE_Q6_K && is_repack_nib_type(eff_g)) ||
+                                  (is_repack_nib_type(eff_u) && eff_g == GGML_TYPE_Q6_K);
+    const bool can_mix = (is_mixed_q5k_q4k || is_mixed_q6k_q5k || is_nib_nib || is_mixed_qkx_nib || is_mixed_q6k_nib) && up->src[2] == nullptr;
+    if (eff_u != eff_g && !can_mix) {
+        return false;
+    }
+    // Q8_0 / Q4_0 / IQ family / Q5_K / Q6_K / mixed: dense decode only
+    const bool dense_only = eff_u == GGML_TYPE_Q8_0 || is_repack_nib_type(eff_u) ||
+                            eff_u == GGML_TYPE_Q5_K || eff_u == GGML_TYPE_Q6_K || can_mix;
+    if (eff_u != GGML_TYPE_Q4_K && !(dense_only && up->src[2] == nullptr)) {
         return false;
     }
     const ggml_glu_op op = ggml_get_glu_op(glu);
@@ -6565,13 +7339,44 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
         // dense decode column
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
         const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
-        if (up_w->type == GGML_TYPE_Q4_0 || up_w->type == GGML_TYPE_IQ4_NL || up_w->type == GGML_TYPE_IQ4_XS ||
-                up_w->type == GGML_TYPE_IQ3_S) {
+        if (is_repack_nib_type(up_w->type) && is_repack_nib_type(gate_w->type)) {
             const dim3 grid((ne01 + 7) / 8, 1, 1);
-            switch (up_w->type) {
-                case GGML_TYPE_Q4_0:  mul_mat_vec_nib_repacked_glu<REPACK_NIB_Q4_0> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
-                case GGML_TYPE_IQ3_S: mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ3S> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
-                default:              mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op); break;
+            if (up_w->type == GGML_TYPE_Q4_0 && gate_w->type == GGML_TYPE_Q4_0) {
+                mul_mat_vec_nib_repacked_glu<REPACK_NIB_Q4_0> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            } else if (up_w->type == GGML_TYPE_IQ3_S && gate_w->type == GGML_TYPE_IQ3_S) {
+                mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ3S> <<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            } else {
+                mul_mat_vec_nib_repacked_glu<REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            }
+            return;
+        }
+        if ((is_repack_nib_type(up_w->type) && (gate_w->type == GGML_TYPE_Q5_K || gate_w->type == GGML_TYPE_Q4_K)) ||
+            ((up_w->type == GGML_TYPE_Q5_K || up_w->type == GGML_TYPE_Q4_K) && is_repack_nib_type(gate_w->type))) {
+            const dim3 grid((ne01 + 7) / 8, 1, 1);
+            const bool up_is_nib = is_repack_nib_type(up_w->type);
+            const ggml_type qkx_t = up_is_nib ? gate_w->type : up_w->type;
+            const ggml_type nib_t = up_is_nib ? up_w->type : gate_w->type;
+            const int mode = repack_nib_mode(nib_t);
+            if (up_is_nib) {
+                if (qkx_t == GGML_TYPE_Q5_K) {
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                } else {
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                }
+            } else {
+                if (qkx_t == GGML_TYPE_Q5_K) {
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                } else {
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                }
             }
             return;
         }
@@ -6593,13 +7398,57 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
                 (uint32_t) ne00, (uint32_t) ne01, glu_op);
             return;
         }
-        if (up_w->type == GGML_TYPE_Q5_K) {
+        if (up_w->type == GGML_TYPE_Q5_K && gate_w->type == GGML_TYPE_Q5_K) {
             const dim3 grid((ne01 + 7) / 8, 1, 1);
             mul_mat_vec_q5k_repacked_glu<<<grid, 256, 0, stream>>>(
                 wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
             return;
         }
-        if (up_w->type == GGML_TYPE_Q6_K) {
+        if ((up_w->type == GGML_TYPE_Q5_K && gate_w->type == GGML_TYPE_Q4_K) ||
+            (up_w->type == GGML_TYPE_Q4_K && gate_w->type == GGML_TYPE_Q5_K)) {
+            const dim3 grid((ne01 + 7) / 8, 1, 1);
+            if (up_w->type == GGML_TYPE_Q5_K) {
+                mul_mat_vec_q5k_q4k_repacked_glu<true, false, 2><<<grid, 256, 0, stream>>>(
+                    wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            } else {
+                mul_mat_vec_q5k_q4k_repacked_glu<false, true, 2><<<grid, 256, 0, stream>>>(
+                    wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            }
+            return;
+        }
+        const ggml_type eff_u = repack_eff_type(up_w->type);
+        const ggml_type eff_g = repack_eff_type(gate_w->type);
+
+        if ((eff_u == GGML_TYPE_Q6_K && eff_g == GGML_TYPE_Q5_K) ||
+            (eff_u == GGML_TYPE_Q5_K && eff_g == GGML_TYPE_Q6_K)) {
+            const dim3 grid((ne01 + 7) / 8, 1, 1);
+            if (eff_u == GGML_TYPE_Q6_K) {
+                mul_mat_vec_q6k_q5k_repacked_glu<true, false, 2><<<grid, 256, 0, stream>>>(
+                    wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            } else {
+                mul_mat_vec_q6k_q5k_repacked_glu<false, true, 2><<<grid, 256, 0, stream>>>(
+                    wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            }
+            return;
+        }
+        if ((eff_u == GGML_TYPE_Q6_K && is_repack_nib_type(eff_g)) ||
+            (is_repack_nib_type(eff_u) && eff_g == GGML_TYPE_Q6_K)) {
+            const dim3 grid((ne01 + 7) / 8, 1, 1);
+            const bool up_is_q6k = (eff_u == GGML_TYPE_Q6_K);
+            const ggml_type nib_t = up_is_q6k ? eff_g : eff_u;
+            const int mode = repack_nib_mode(nib_t);
+            if (up_is_q6k) {
+                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else                               mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            } else {
+                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else                               mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+            }
+            return;
+        }
+        if (eff_u == GGML_TYPE_Q6_K) {
             const dim3 grid((ne01 + 7) / 8, 1, 1);
             mul_mat_vec_q6k_repacked_glu<<<grid, 256, 0, stream>>>(
                 wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
