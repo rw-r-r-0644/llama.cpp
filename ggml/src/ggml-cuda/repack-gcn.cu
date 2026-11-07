@@ -95,6 +95,10 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
+    // token_embd is read by GET_ROWS which expects canonical quantization blocks, not repacked
+    if (strcmp(t->name, "token_embd.weight") == 0) {
+        return false;
+    }
     switch (t->type) {
         // K-quants: on by default, one switch per tensor type (GGML_CUDA_REPACK_Q3_K / _Q4_K / _Q5_K / _Q6_K).
         // Q3_K is stored and run as Q6_K planes (repack_eff_type), but the switch follows the tensor type:
