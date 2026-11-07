@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -361,7 +362,8 @@ static __global__ void rms_norm_scale2_f32(const float * x0, float * dst0, const
     }
 }
 
-static __global__ void __launch_bounds__(256) rms_norm_mul_sigmoid_gate_f32(
+template <bool is_silu>
+static __global__ void __launch_bounds__(256) rms_norm_mul_gate_f32(
         const float * x, const int64_t sx1, const int64_t sx2, const int64_t sx3, const float * __restrict__ mul, const int64_t smul1,
         const float * z, const int64_t sz1, float * dst, const int ncols, const float eps, block_q8_1 * __restrict__ yq) {
     const int nrows     = gridDim.x;
@@ -390,7 +392,8 @@ static __global__ void __launch_bounds__(256) rms_norm_mul_sigmoid_gate_f32(
 
     for (int col = tid; col < ncols; col += 256) {
         const float nv = scale * x[col] * mr[col];
-        const float v  = (1.0f / (1.0f + expf(-zr[col]))) * nv;
+        const float g  = is_silu ? ggml_cuda_op_silu_single(zr[col]) : (1.0f / (1.0f + expf(-zr[col])));
+        const float v  = g * nv;
         dst[lrow*ncols + col] = v;
         if (yq != nullptr) {
             rms_emit_q8_1(yq, lrow*ncols + col, v);
@@ -835,11 +838,11 @@ bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor *
     return true;
 }
 
-bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
-        ggml_tensor * sig, ggml_tensor * gate_mul, void * yq) {
+bool ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+        ggml_tensor * gate, ggml_tensor * gate_mul, void * yq) {
     const ggml_tensor * x = norm->src[0];
     const ggml_tensor * w = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
-    const ggml_tensor * z = sig->src[0];
+    const ggml_tensor * z = gate->src[0];
     const int64_t ncols = x->ne[0];
     const bool w_bcast = ggml_nelements(w) == ncols;
     if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || gate_mul->type != GGML_TYPE_F32 ||
@@ -853,11 +856,24 @@ bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggm
     float eps;
     memcpy(&eps, norm->op_params, sizeof(float));
     const dim3 blocks_num(x->ne[1], x->ne[2], x->ne[3]);
-    rms_norm_mul_sigmoid_gate_f32<<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
-        (const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
-        (const float *) w->data, w_bcast ? 0 : ncols, (const float *) z->data, z->nb[1] / sizeof(float),
-        (float *) gate_mul->data, (int) ncols, eps, (block_q8_1 *) yq);
+    const bool is_silu = (gate->op == GGML_OP_UNARY && ggml_get_unary_op(gate) == GGML_UNARY_OP_SILU);
+    if (is_silu) {
+        rms_norm_mul_gate_f32<true><<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
+            (const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+            (const float *) w->data, w_bcast ? 0 : ncols, (const float *) z->data, z->nb[1] / sizeof(float),
+            (float *) gate_mul->data, (int) ncols, eps, (block_q8_1 *) yq);
+    } else {
+        rms_norm_mul_gate_f32<false><<<blocks_num, 256, 32 * sizeof(float), ctx.stream()>>>(
+            (const float *) x->data, x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), x->nb[3] / sizeof(float),
+            (const float *) w->data, w_bcast ? 0 : ncols, (const float *) z->data, z->nb[1] / sizeof(float),
+            (float *) gate_mul->data, (int) ncols, eps, (block_q8_1 *) yq);
+    }
     return true;
+}
+
+bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+        ggml_tensor * sig, ggml_tensor * gate_mul, void * yq) {
+    return ggml_cuda_op_rms_norm_mul_gate(ctx, norm, mul_tensor, sig, gate_mul, yq);
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

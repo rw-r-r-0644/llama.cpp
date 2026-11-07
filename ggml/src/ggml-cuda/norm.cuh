@@ -29,7 +29,10 @@ bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tenso
 // two independent same-shape RMS_NORM -> SCALE pairs in one launch; false = not applicable
 bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor * n0, ggml_tensor * sc0, ggml_tensor * n1, ggml_tensor * sc1);
 
-// RMS_NORM -> MUL(w) -> MUL(SIGMOID(z)) (GDN output gate) in one launch, q8_1 copy into yq when non-null;
-// false = not applicable, nothing launched
+// RMS_NORM -> MUL(w) -> MUL(GATE(z)) where GATE is SIGMOID or SILU (GDN output gate) in one launch,
+// q8_1 copy into yq when non-null; false = not applicable, nothing launched
+bool ggml_cuda_op_rms_norm_mul_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+        ggml_tensor * gate, ggml_tensor * gate_mul, void * yq);
+
 bool ggml_cuda_op_rms_norm_mul_sigmoid_gate(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
         ggml_tensor * sig, ggml_tensor * gate_mul, void * yq);

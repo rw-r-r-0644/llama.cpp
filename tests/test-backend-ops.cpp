@@ -4124,6 +4124,44 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// GDN output gate: RMS_NORM -> MUL(w) -> MUL(SIGMOID/SILU(z)) (fused on HIP backend)
+struct test_gate_norm : public test_case {
+    const int64_t n_tokens;
+    const bool is_silu;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATE_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, is_silu);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gate_norm(int64_t n_tokens = 1, bool is_silu = false) : n_tokens(n_tokens), is_silu(is_silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 48, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        ggml_set_name(w, "w");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 48, n_tokens);
+        ggml_set_name(z, "z");
+        ggml_tensor * gate = is_silu ? ggml_silu(ctx, z) : ggml_sigmoid(ctx, z);
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), gate);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -2.f, 2.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -11342,6 +11380,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
+
+    for (int64_t nt : { 1, 3 }) {
+        test_cases.emplace_back(new test_gate_norm(nt, false));
+        test_cases.emplace_back(new test_gate_norm(nt, true));
+    }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));

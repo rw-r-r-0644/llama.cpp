@@ -5183,7 +5183,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // RMS_NORM -> MUL(w) -> [views] -> SIGMOID(z) -> MUL (GDN output gate) in one launch
+    // RMS_NORM -> MUL(w) -> [views] -> SIGMOID/SILU(z) -> MUL (GDN output gate) in one launch
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         static const bool no_gate_norm = getenv("GGML_CUDA_NO_GATE_NORM_FUSION") != nullptr;
         int j = i + 2;
@@ -5194,7 +5194,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * sig  = j + 1 < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
         ggml_tensor * gmul = j + 1 < cgraph->n_nodes ? cgraph->nodes[j + 1] : nullptr;
         if (!no_gate_norm && sig != nullptr && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
-                sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && ggml_node_has_n_uses(cgraph, j, 1) &&
+                sig->op == GGML_OP_UNARY &&
+                (ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(sig) == GGML_UNARY_OP_SILU) &&
+                ggml_node_has_n_uses(cgraph, j, 1) &&
                 gmul->op == GGML_OP_MUL && ((gmul->src[0] == mul && gmul->src[1] == sig) || (gmul->src[0] == sig && gmul->src[1] == mul)) &&
                 (sig->flags & GGML_TENSOR_FLAG_COMPUTE) && (gmul->flags & GGML_TENSOR_FLAG_COMPUTE)) {
             // a thread reads x and z at a column before it writes the output there: the output may sit
@@ -5209,7 +5211,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * w = mul->src[0] == node ? mul->src[1] : mul->src[0];
             if (ok_alias(x) && ok_alias(z) && ok_alias(w)) {
                 void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, gmul);
-                if (ggml_cuda_op_rms_norm_mul_sigmoid_gate(*cuda_ctx, node, mul, sig, gmul, yq)) {
+                if (ggml_cuda_op_rms_norm_mul_gate(*cuda_ctx, node, mul, sig, gmul, yq)) {
                     return j + 1 - i;
                 }
                 if (yq != nullptr) {
