@@ -1275,10 +1275,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
         }
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const int row = row0 + r;
-            if (row >= (int) ne1) {
-                continue;
-            }
             const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[r]));
             const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
             int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
@@ -1385,10 +1381,6 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
         for (int w2 = 0; w2 < 2; w2++) {
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
-                const int row = row0 + r;
-                if (row >= (int) ne1) {
-                    continue;
-                }
                 const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[w2][r]));
                 const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
                 int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
