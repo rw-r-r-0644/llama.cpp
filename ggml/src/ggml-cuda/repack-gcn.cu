@@ -1412,25 +1412,24 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
             xs3 = ggml_cuda_dp4a(0x01010101, xq32[7], xs3);
             xqsum = (xs0 + xs1) + (xs2 + xs3);
         }
-        uint4    q[2][ROWS];
-        uint16_t db[2][ROWS];
-#pragma unroll
-        for (int w2 = 0; w2 < 2; w2++) {
-#pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                const size_t idx = row_idx[r] + sb;
-                q[w2][r]  = nib[w2][idx];
-                db[w2][r] = dp[w2][idx];
-            }
-        }
-        __builtin_amdgcn_sched_barrier(0);
         const float dx = __low2float(xb->ds);
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
+            uint4    q[ROWS];
+            uint16_t db[ROWS];
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
-                const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[w2][r]));
-                const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
+                q[r] = nib[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                db[r] = dp[w2][row_idx[r] + sb];
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db[r]));
+                const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
                 int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
                 if constexpr (MODE == REPACK_NIB_Q4_0) {
                     dot0 = ggml_cuda_dp4a((int)( qa[0]       & 0x0F0F0F0Fu), xq32[0], 0);
@@ -2977,34 +2976,41 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked_glu(
         const block_q8_1 * xb = xq + sb;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
-        uint4    q[2][ROWS];
-        uint32_t qh[2][ROWS];
-        uint16_t sm[2][ROWS];
-        uint32_t dd[2][ROWS];
-#pragma unroll
-        for (int w2 = 0; w2 < 2; w2++) {
-#pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                const size_t idx = row_idx[r] + sb;
-                q[w2][r]  = nib[w2][idx];
-                qh[w2][r] = qhp[w2][idx];
-                sm[w2][r] = smp[w2][idx];
-                dd[w2][r] = ddp[w2][row_sup[r] + (sb >> 3)];
-            }
-        }
-        __builtin_amdgcn_sched_barrier(0);
         const float2 dx_sx = __half22float2(xb->ds);
         const float dx = dx_sx.x;
         const float sx = dx_sx.y;
+
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
+            uint4    q[ROWS];
+            uint32_t qh[ROWS];
+            uint16_t sm[ROWS];
+            uint32_t dd[ROWS];
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
-                const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[w2][r]));
-                const float dsc  = d_dmin.x * (float)(sm[w2][r] & 0xFFu);
-                const float deff = d_dmin.y * (float)(sm[w2][r] >> 8);
-                const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
-                const uint32_t qhr = qh[w2][r];
+                q[r] = nib[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                qh[r] = qhp[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                sm[r] = smp[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                dd[r] = ddp[w2][row_sup[r] + (sb >> 3)];
+            }
+            __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
+                const float dsc  = d_dmin.x * (float)(sm[r] & 0xFFu);
+                const float deff = d_dmin.y * (float)(sm[r] >> 8);
+                const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
+                const uint32_t qhr = qh[r];
 
                 const uint32_t lo0 = ( qa[0]       & 0x0F0F0F0Fu) | repack_spread4(qhr >> 0);
                 const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4_hi(qhr >> 0);
@@ -3100,37 +3106,41 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_q4k_repacked_glu(
         const block_q8_1 * xb = xq + sb;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
-        uint4    q[2][ROWS];
-        uint32_t qh_5k[ROWS];
-        uint16_t sm[2][ROWS];
-        uint32_t dd[2][ROWS];
-#pragma unroll
-        for (int w2 = 0; w2 < 2; w2++) {
-            const bool is_q5k = (w2 == 0) ? UP_IS_Q5K : GATE_IS_Q5K;
-#pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                const size_t idx = row_idx[r] + sb;
-                q[w2][r]  = nib[w2][idx];
-                if (is_q5k) {
-                    qh_5k[r] = qhp[w2][idx];
-                }
-                sm[w2][r] = smp[w2][idx];
-                dd[w2][r] = ddp[w2][row_sup[r] + (sb >> 3)];
-            }
-        }
-        __builtin_amdgcn_sched_barrier(0);
         const float2 dx_sx = __half22float2(xb->ds);
         const float dx = dx_sx.x;
         const float sx = dx_sx.y;
+
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
             const bool is_q5k = (w2 == 0) ? UP_IS_Q5K : GATE_IS_Q5K;
+            uint4    q[ROWS];
+            uint32_t qh[ROWS];
+            uint16_t sm[ROWS];
+            uint32_t dd[ROWS];
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
-                const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[w2][r]));
-                const float dsc  = d_dmin.x * (float)(sm[w2][r] & 0xFFu);
-                const float deff = d_dmin.y * (float)(sm[w2][r] >> 8);
-                const uint32_t qa[4] = { q[w2][r].x, q[w2][r].y, q[w2][r].z, q[w2][r].w };
+                q[r] = nib[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                qh[r] = is_q5k ? qhp[w2][row_idx[r] + sb] : 0u;
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                sm[r] = smp[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                dd[r] = ddp[w2][row_sup[r] + (sb >> 3)];
+            }
+            __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd[r]));
+                const float dsc  = d_dmin.x * (float)(sm[r] & 0xFFu);
+                const float deff = d_dmin.y * (float)(sm[r] >> 8);
+                const uint32_t qa[4] = { q[r].x, q[r].y, q[r].z, q[r].w };
 
                 uint32_t lo0 = qa[0]       & 0x0F0F0F0Fu;
                 uint32_t hi0 = (qa[0] >> 4) & 0x0F0F0F0Fu;
@@ -3142,7 +3152,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_q4k_repacked_glu(
                 uint32_t hi3 = (qa[3] >> 4) & 0x0F0F0F0Fu;
 
                 if (is_q5k) {
-                    const uint32_t qhr = qh_5k[r];
+                    const uint32_t qhr = qh[r];
                     lo0 |= repack_spread4(qhr >> 0);
                     hi0 |= repack_spread4_hi(qhr >> 0);
                     lo1 |= repack_spread4(qhr >> 8);
@@ -3235,35 +3245,33 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_qkx_nib_repacked_glu(
         const block_q8_1 * xb = xq + sb;
         const int * xq32 = reinterpret_cast<const int *>(xb->qs);
 
-        // --- Issue loads for both slabs concurrently ---
+        const float2 dx_sx = __half22float2(xb->ds);
+        const float dx = dx_sx.x;
+        const float sx = dx_sx.y;
+
+        // --- Evaluate QKX slab ---
         uint4    q_qkx[ROWS];
         uint32_t qh_qkx[ROWS];
         uint16_t sm_qkx[ROWS];
         uint32_t dd_qkx[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const size_t idx = row_idx[r] + sb;
-            q_qkx[r]  = qkx_nib[idx];
-            qh_qkx[r] = QKX_IS_Q5K ? qkx_qhp[idx] : 0u;
-            sm_qkx[r] = qkx_smp[idx];
-            dd_qkx[r] = qkx_ddp[row_sup[r] + (sb >> 3)];
+            q_qkx[r] = qkx_nib[row_idx[r] + sb];
         }
-
-        uint4    q_nib[ROWS];
-        uint16_t dp_nib[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const size_t idx = row_idx[r] + sb;
-            q_nib[r]  = nib_nib[idx];
-            dp_nib[r] = nib_dp[idx];
+            qh_qkx[r] = QKX_IS_Q5K ? qkx_qhp[row_idx[r] + sb] : 0u;
         }
-
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm_qkx[r] = qkx_smp[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            dd_qkx[r] = qkx_ddp[row_sup[r] + (sb >> 3)];
+        }
         __builtin_amdgcn_sched_barrier(0);
-        const float2 dx_sx = __half22float2(xb->ds);
-        const float dx = dx_sx.x;
-        const float sx = dx_sx.y;
 
-        // --- Evaluate QKX slab ---
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const float2 d_dmin = __half22float2(*reinterpret_cast<const __half2 *>(&dd_qkx[r]));
@@ -3306,7 +3314,19 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_qkx_nib_repacked_glu(
             acc_qkx[r] += dsc * dx * (float) idot - deff * sx;
         }
 
-        // --- Evaluate NIB slab ---
+        // --- Evaluate NIB slab (q_qkx registers are dead and can be reused) ---
+        uint4    q_nib[ROWS];
+        uint16_t dp_nib[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            q_nib[r] = nib_nib[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            dp_nib[r] = nib_dp[row_idx[r] + sb];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
             const float dw = __half2float(*reinterpret_cast<const __half *>(&dp_nib[r]));
@@ -3399,8 +3419,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_q5k_repacked_glu(
         row_sup[r] = (size_t) row * n_super;
     }
 
-    float acc_q6k[ROWS] = {0.0f, 0.0f};
-    float acc_q5k[ROWS] = {0.0f, 0.0f};
+    float acc_q6k[ROWS] = {};
+    float acc_q5k[ROWS] = {};
 
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
@@ -3426,10 +3446,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_q5k_repacked_glu(
         uint16_t db_6k[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const size_t idx = row_idx[r] + sb;
-            q_6k[r]  = nib_q6k[idx];
-            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[idx];
-            sm_6k[r] = smp_q6k[idx];
+            q_6k[r] = nib_q6k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm_6k[r] = smp_q6k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             db_6k[r] = ddp_q6k[row_sup[r] + (sb >> 3)];
         }
         __builtin_amdgcn_sched_barrier(0);
@@ -3485,10 +3513,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_q5k_repacked_glu(
         uint32_t dd_5k[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const size_t idx = row_idx[r] + sb;
-            q_5k[r]  = nib_q5k[idx];
-            qh_5k[r] = qhp_q5k[idx];
-            sm_5k[r] = smp_q5k[idx];
+            q_5k[r] = nib_q5k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            qh_5k[r] = qhp_q5k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm_5k[r] = smp_q5k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             dd_5k[r] = ddp_q5k[row_sup[r] + (sb >> 3)];
         }
         __builtin_amdgcn_sched_barrier(0);
@@ -3499,15 +3535,16 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_q5k_repacked_glu(
             const float dsc  = d_dmin.x * (float)(sm_5k[r] & 0xFFu);
             const float deff = d_dmin.y * (float)(sm_5k[r] >> 8);
             const uint32_t qa[4] = { q_5k[r].x, q_5k[r].y, q_5k[r].z, q_5k[r].w };
+            const uint32_t qhr = qh_5k[r];
 
-            const uint32_t lo0 = (qa[0]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  0) & 0xFu);
-            const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  4) & 0xFu);
-            const uint32_t lo1 = (qa[1]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >>  8) & 0xFu);
-            const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 12) & 0xFu);
-            const uint32_t lo2 = (qa[2]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 16) & 0xFu);
-            const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 20) & 0xFu);
-            const uint32_t lo3 = (qa[3]       & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 24) & 0xFu);
-            const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4((qh_5k[r] >> 28) & 0xFu);
+            const uint32_t lo0 = (qa[0]       & 0x0F0F0F0Fu) | repack_spread4(qhr >>  0);
+            const uint32_t hi0 = ((qa[0] >> 4) & 0x0F0F0F0Fu) | repack_spread4_hi(qhr >>  0);
+            const uint32_t lo1 = (qa[1]       & 0x0F0F0F0Fu) | repack_spread4(qhr >>  8);
+            const uint32_t hi1 = ((qa[1] >> 4) & 0x0F0F0F0Fu) | repack_spread4_hi(qhr >>  8);
+            const uint32_t lo2 = (qa[2]       & 0x0F0F0F0Fu) | repack_spread4(qhr >> 16);
+            const uint32_t hi2 = ((qa[2] >> 4) & 0x0F0F0F0Fu) | repack_spread4_hi(qhr >> 16);
+            const uint32_t lo3 = (qa[3]       & 0x0F0F0F0Fu) | repack_spread4(qhr >> 24);
+            const uint32_t hi3 = ((qa[3] >> 4) & 0x0F0F0F0Fu) | repack_spread4_hi(qhr >> 24);
 
             int dot0 = ggml_cuda_dp4a((int) lo0, xq32[0], 0);
             int dot1 = ggml_cuda_dp4a((int) hi0, xq32[4], 0);
@@ -3584,8 +3621,8 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_nib_repacked_glu(
         row_sup[r] = (size_t) row * n_super;
     }
 
-    float acc_q6k[ROWS] = {0.0f, 0.0f};
-    float acc_nib[ROWS] = {0.0f, 0.0f};
+    float acc_q6k[ROWS] = {};
+    float acc_nib[ROWS] = {};
 
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
@@ -3614,10 +3651,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_nib_repacked_glu(
         uint16_t db_6k[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            const size_t idx = row_idx[r] + sb;
-            q_6k[r]  = nib_q6k[idx];
-            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[idx];
-            sm_6k[r] = smp_q6k[idx];
+            q_6k[r] = nib_q6k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            h2_6k[r] = reinterpret_cast<const uint2 *>(h2p_q6k)[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm_6k[r] = smp_q6k[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             db_6k[r] = ddp_q6k[row_sup[r] + (sb >> 3)];
         }
         __builtin_amdgcn_sched_barrier(0);
@@ -3794,10 +3839,18 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked_glu(
             uint16_t db[ROWS];
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
-                const size_t idx = row_idx[r] + sb;
-                q[r]  = nib[w2][idx];
-                h2[r] = reinterpret_cast<const uint2 *>(h2p[w2])[idx];
-                sm[r] = smp[w2][idx];
+                q[r] = nib[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                h2[r] = reinterpret_cast<const uint2 *>(h2p[w2])[row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                sm[r] = smp[w2][row_idx[r] + sb];
+            }
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
                 db[r] = ddp[w2][row_sup[r] + (sb >> 3)];
             }
             __builtin_amdgcn_sched_barrier(0);
@@ -7404,23 +7457,23 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
             const int mode = repack_nib_mode(nib_t);
             if (up_is_nib) {
                 if (qkx_t == GGML_TYPE_Q5_K) {
-                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<true, true, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
                 } else {
-                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<true, false, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
                 }
             } else {
                 if (qkx_t == GGML_TYPE_Q5_K) {
-                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<false, true, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
                 } else {
-                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                    else mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    if (mode == REPACK_NIB_Q4_0)  mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else if (mode == REPACK_NIB_IQ3S) mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                    else mul_mat_vec_qkx_nib_repacked_glu<false, false, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
                 }
             }
             return;
@@ -7445,7 +7498,7 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
         }
         if (up_w->type == GGML_TYPE_Q5_K && gate_w->type == GGML_TYPE_Q5_K) {
             const dim3 grid((ne01 + 7) / 8, 1, 1);
-            mul_mat_vec_q5k_repacked_glu<<<grid, 256, 0, stream>>>(
+            mul_mat_vec_q5k_repacked_glu<2><<<grid, 256, 0, stream>>>(
                 wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
             return;
         }
@@ -7483,19 +7536,19 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
             const ggml_type nib_t = up_is_q6k ? eff_g : eff_u;
             const int mode = repack_nib_mode(nib_t);
             if (up_is_q6k) {
-                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                else                               mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else                               mul_mat_vec_q6k_nib_repacked_glu<true, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
             } else {
-                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_Q4_0><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ3S><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
-                else                               mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ4NL><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                if (mode == REPACK_NIB_Q4_0)       mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_Q4_0, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else if (mode == REPACK_NIB_IQ3S)  mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ3S, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
+                else                               mul_mat_vec_q6k_nib_repacked_glu<false, REPACK_NIB_IQ4NL, 2><<<grid, 256, 0, stream>>>(wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
             }
             return;
         }
         if (eff_u == GGML_TYPE_Q6_K) {
             const dim3 grid((ne01 + 7) / 8, 1, 1);
-            mul_mat_vec_q6k_repacked_glu<<<grid, 256, 0, stream>>>(
+            mul_mat_vec_q6k_repacked_glu<2><<<grid, 256, 0, stream>>>(
                 wu, wg, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, glu_op);
             return;
         }
