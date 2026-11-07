@@ -942,8 +942,14 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked(
         uint32_t dd[ROWS];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
-            q[r]  = nib[row_idx[r] + sb];
+            q[r] = nib[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             sm[r] = smp[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             dd[r] = ddp[row_sup[r] + (sb >> 3)];
         }
         if constexpr (FENCE) {
@@ -1150,11 +1156,19 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q5k_repacked(
         uint16_t sm[ROWS];
         uint32_t dd[ROWS];
 #pragma unroll
-        for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
-            const size_t idx = row_idx[r] + sb;
-            q[r]  = nib[idx];
-            qh[r] = qhp[idx];
-            sm[r] = smp[idx];
+        for (int r = 0; r < ROWS; r++) {
+            q[r] = nib[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            qh[r] = qhp[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm[r] = smp[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             dd[r] = ddp[row_sup[r] + (sb >> 3)];
         }
         if constexpr (FENCE) {
@@ -2126,11 +2140,19 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q6k_repacked(
         uint16_t sm[ROWS];
         uint16_t db[ROWS];
 #pragma unroll
-        for (int r = 0; r < ROWS; r++) { // rows clamped, store masked (crossport R10)
-            const size_t idx = row_idx[r] + sb;
-            q[r]  = nib[idx];
-            h2[r] = reinterpret_cast<const uint2 *>(h2p)[idx];
-            sm[r] = smp[idx];
+        for (int r = 0; r < ROWS; r++) {
+            q[r] = nib[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            h2[r] = reinterpret_cast<const uint2 *>(h2p)[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            sm[r] = smp[row_idx[r] + sb];
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
             db[r] = ddp[row_sup[r] + (sb >> 3)];
         }
         __builtin_amdgcn_sched_barrier(0);
