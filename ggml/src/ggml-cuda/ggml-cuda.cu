@@ -3046,6 +3046,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t) {
+    return ggml_cuda_is_view_or_noop(t);
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
@@ -4146,6 +4150,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_CONCAT) {
+        const int n = ggml_cuda_try_conv_step_fusion(*cuda_ctx, cgraph, i);
+        if (n >= 0) {
+            return n;
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -5130,8 +5141,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                // a recurrent-state gather read in place by its gated_delta_net
-                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_gdn_state_gather_elidable(cgraph, node)) {
+                // a recurrent-state gather read in place by its gated_delta_net or its fused conv step
+                if (node->op == GGML_OP_GET_ROWS && (ggml_cuda_gdn_state_gather_elidable(cgraph, node) ||
+                        ggml_cuda_conv_state_gather_elidable(cgraph, node))) {
                     continue;
                 }
 
@@ -5360,6 +5372,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        ggml_cuda_conv_step_graph_optimize(cgraph);
+
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
