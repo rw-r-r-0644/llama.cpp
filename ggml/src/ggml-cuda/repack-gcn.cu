@@ -1236,6 +1236,12 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
     const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 16);
 
     float acc[ROWS] = {0.0f, 0.0f};
+    size_t row_idx[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        row_idx[r] = (size_t) min(row0 + r, (int) ne1 - 1) * nsp;
+    }
+
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
         const block_q8_1 * xb = xq + sb;
         const float dx = __low2float(xb->ds);
@@ -1258,7 +1264,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked(
             if (row >= (int) ne1) {
                 continue;
             }
-            const size_t   idx = (size_t) row * nsp + sb;
+            const size_t   idx = row_idx[r] + sb;
             const uint4    q   = nib[idx];
             const uint16_t db  = dp[idx];
             const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
@@ -1321,7 +1327,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
     const int row0 = blockIdx.x * (ROWS * 4) + wave * ROWS;
     const uint32_t n_sub = ne0 >> 5;
     const uint32_t nsp   = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
-    const uint8_t * wb[2] = { wup, wgate };
+    const size_t dp_offset = (size_t) ne1 * nsp * 16;
+    const uint4    * nib[2] = { reinterpret_cast<const uint4 *>(wup), reinterpret_cast<const uint4 *>(wgate) };
+    const uint16_t * dp[2]  = { reinterpret_cast<const uint16_t *>(wup + dp_offset), reinterpret_cast<const uint16_t *>(wgate + dp_offset) };
+
+    size_t row_idx[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) {
+        row_idx[r] = (size_t) min(row0 + r, (int) ne1 - 1) * nsp;
+    }
 
     float acc[2][ROWS] = {};
     for (uint32_t sb = lane; sb < n_sub; sb += 64) {
@@ -1342,17 +1356,15 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_nib_repacked_glu(
         }
 #pragma unroll
         for (int w2 = 0; w2 < 2; w2++) {
-            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
-            const uint16_t * dp  = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
                 const int row = row0 + r;
                 if (row >= (int) ne1) {
                     continue;
                 }
-                const size_t   idx = (size_t) row * nsp + sb;
-                const uint4    q   = nib[idx];
-                const uint16_t db  = dp[idx];
+                const size_t   idx = row_idx[r] + sb;
+                const uint4    q   = nib[w2][idx];
+                const uint16_t db  = dp[w2][idx];
                 const float    dw  = __half2float(*reinterpret_cast<const __half *>(&db));
                 const uint32_t qa[4] = { q.x, q.y, q.z, q.w };
                 int dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
