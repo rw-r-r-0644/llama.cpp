@@ -1787,9 +1787,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = h_rows;
             verify_h[seq_id].resize((size_t) h_rows * n_embd);
 
-            for (int32_t i = 0; i < h_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            const float * h_base = llama_get_embeddings_nextn(ctx_tgt);
+            if (h_base != nullptr) {
+                std::memcpy(verify_h[seq_id].data(), h_base + (size_t) h_offset * n_embd, (size_t) h_rows * row_bytes);
+            } else {
+                for (int32_t i = 0; i < h_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
             }
 
             std::memcpy(pending_h[seq_id].data(),

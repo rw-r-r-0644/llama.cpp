@@ -307,8 +307,9 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main; // I32 [n_seqs]
-    ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+    ggml_tensor * s_copy_main;  // I32 [n_seqs]
+    ggml_tensor * s_copy_tail;  // I32 [n_rs - 1]
+    ggml_tensor * s_copy_extra; // I32 [n_rs_extra]
 
     const llama_memory_recurrent_context * mctx;
 
@@ -1423,6 +1424,7 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * state_copy,
             ggml_tensor * state_copy_main,
+            ggml_tensor * state_copy_extra,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,

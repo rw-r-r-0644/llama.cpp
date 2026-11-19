@@ -945,11 +945,12 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    if (!sched || is_synchronized) {
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    is_synchronized = true;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2974,6 +2975,7 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    is_synchronized = false;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
