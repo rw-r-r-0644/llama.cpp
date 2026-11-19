@@ -229,6 +229,167 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// q8_1 of one value per lane, 32 consecutive lanes = one block: the arithmetic of quantize_q8_1
+static __device__ __forceinline__ void rms_emit_q8_1(block_q8_1 * yq, const int64_t idx, const float v) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    const int64_t ib  = idx / QK8_1;
+    const int     iqs = idx % QK8_1;
+    yq[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        yq[ib].ds = make_half2(d, sum);
+    }
+}
+
+// RMS_NORM -> MUL that also writes the result as q8_1 for a repacked matvec consumer
+// (see ggml_cuda_repack_xq_emit_target); ncols % 32 == 0, contiguous dst
+template <int block_size, int vpt = 0>
+static __global__ void rms_norm_mul_q8_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float * mul,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed,
+        const uint3 mul_nsamples_packed, block_q8_1 * yq) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t dst_off = ((int64_t)(sample*nchannels + channel)*nrows + row)*ncols;
+    dst += dst_off;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    if constexpr (vpt > 0) {
+        float xi_buf[vpt];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int col = tid + k * block_size;
+            if (col < ncols) {
+                const float xi = x[col];
+                xi_buf[k] = xi;
+                tmp += xi * xi;
+            }
+        }
+
+        extern __shared__ float s_sum[];
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int col = tid + k * block_size;
+            if (col < ncols) {
+                const int mul_col = fastmodulo(col, mul_ncols_packed);
+                const float v = scale * xi_buf[k] * mul[mul_col];
+                dst[col] = v;
+                rms_emit_q8_1(yq, dst_off + col, v);
+            }
+        }
+    } else {
+        float tmp = 0.0f;
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
+
+        extern __shared__ float s_sum[];
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        for (int col = tid; col < ncols; col += block_size) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const float v = scale * x[col] * mul[mul_col];
+            dst[col] = v;
+            rms_emit_q8_1(yq, dst_off + col, v);
+        }
+    }
+}
+
+// residual ADD -> RMS_NORM -> MUL in one kernel: writes the sum (the residual stream, still read later)
+// and the normed activation, plus q8_1 blocks when yq != nullptr. Each thread reads a, b at a column
+// before writing sum there, and the block reduction separates the two passes, so sum may alias a or b
+// and dst may alias a or b exactly. Same operation order as the three ops, so results are identical.
+template <int block_size, int vpt = 0>
+static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum, float * dst,
+        const int ncols, const float eps, const float * mul, block_q8_1 * yq) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int64_t off = (int64_t) row * ncols;
+    a += off; b += off; sum += off; dst += off;
+
+    if constexpr (vpt > 0) {
+        float xi_buf[vpt];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int col = tid + k * block_size;
+            if (col < ncols) {
+                const float xi = a[col] + b[col];
+                sum[col] = xi;
+                xi_buf[k] = xi;
+                tmp += xi * xi;
+            }
+        }
+
+        extern __shared__ float s_sum[];
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int col = tid + k * block_size;
+            if (col < ncols) {
+                const float xi = xi_buf[k];
+                const float v = scale * xi * mul[col];
+                dst[col] = v;
+                if (yq != nullptr) {
+                    rms_emit_q8_1(yq, off + col, v);
+                }
+            }
+        }
+    } else {
+        float tmp = 0.0f;
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = a[col] + b[col];
+            sum[col] = xi;
+            tmp += xi * xi;
+        }
+
+        extern __shared__ float s_sum[];
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = sum[col];
+            const float v = scale * xi * mul[col];
+            dst[col] = v;
+            if (yq != nullptr) {
+                rms_emit_q8_1(yq, off + col, v);
+            }
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -691,6 +852,170 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+bool ggml_cuda_op_rms_norm_fused_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * yq) {
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * mul_src = mul_tensor->src[0] == dst ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ne00 = src->ne[0];
+    if (yq == nullptr || ne00 % QK8_1 != 0 || ne00 < 1024 || !ggml_is_contiguous(mul_tensor) ||
+            !ggml_are_same_shape(mul_tensor, dst) || src->nb[0] != sizeof(float) || mul_src->nb[0] != sizeof(float) ||
+            mul_src->type != GGML_TYPE_F32) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    const dim3 blocks_num(src->ne[1], src->ne[2], src->ne[3]);
+    const int vpt = (int)((ne00 + 1023) / 1024);
+    switch (vpt) {
+        case 1:
+            rms_norm_mul_q8_f32<1024, 1><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 2:
+            rms_norm_mul_q8_f32<1024, 2><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 3:
+            rms_norm_mul_q8_f32<1024, 3><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 4:
+            rms_norm_mul_q8_f32<1024, 4><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 5:
+            rms_norm_mul_q8_f32<1024, 5><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 6:
+            rms_norm_mul_q8_f32<1024, 6><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        case 7:
+        case 8:
+            rms_norm_mul_q8_f32<1024, 8><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+        default:
+            rms_norm_mul_q8_f32<1024, 0><<<blocks_num, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) src->data, (float *) mul_tensor->data, (int) ne00,
+                src->nb[1] / sizeof(float), src->nb[2] / sizeof(float), src->nb[3] / sizeof(float), eps,
+                (const float *) mul_src->data, mul_src->nb[1] / sizeof(float), mul_src->nb[2] / sizeof(float), mul_src->nb[3] / sizeof(float),
+                init_fastdiv_values(mul_src->ne[0]), init_fastdiv_values(mul_src->ne[1]),
+                init_fastdiv_values(mul_src->ne[2]), init_fastdiv_values(mul_src->ne[3]), (block_q8_1 *) yq);
+            break;
+    }
+    return true;
+}
+
+bool ggml_cuda_op_add_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm,
+        ggml_tensor * mul_tensor, void * yq) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ncols = add->ne[0];
+    const int64_t nrows = ggml_nrows(add);
+    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            w->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) || !ggml_are_same_shape(add, mul_tensor) ||
+            !ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) ||
+            !ggml_is_contiguous(mul_tensor) || !ggml_is_contiguous(w) || ggml_nelements(w) != ncols ||
+            norm->src[0] != add || ncols < 1024 || (yq != nullptr && ncols % QK8_1 != 0)) {
+        return false;
+    }
+    // outputs may equal an input exactly (in place) but must not partially overlap one
+    auto partial = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+        const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+        return x0 < y1 && y0 < x1 && !(x0 == y0 && x1 == y1);
+    };
+    const ggml_tensor * outs[2] = { add, mul_tensor };
+    for (const ggml_tensor * o : outs) {
+        if (partial(o, a) || partial(o, b) || partial(o, w)) {
+            return false;
+        }
+    }
+    const char * s0 = (const char *) add->data;        const char * s1 = s0 + ggml_nbytes(add);
+    const char * d0 = (const char *) mul_tensor->data; const char * d1 = d0 + ggml_nbytes(mul_tensor);
+    if (s0 < d1 && d0 < s1) {
+        return false; // sum and dst both live after the kernel
+    }
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int vpt = (int)((ncols + 1023) / 1024);
+    switch (vpt) {
+        case 1:
+            add_rms_norm_mul_f32<1024, 1><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 2:
+            add_rms_norm_mul_f32<1024, 2><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 3:
+            add_rms_norm_mul_f32<1024, 3><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 4:
+            add_rms_norm_mul_f32<1024, 4><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 5:
+            add_rms_norm_mul_f32<1024, 5><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 6:
+            add_rms_norm_mul_f32<1024, 6><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        case 7:
+        case 8:
+            add_rms_norm_mul_f32<1024, 8><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+        default:
+            add_rms_norm_mul_f32<1024, 0><<<(int) nrows, 1024, 32 * sizeof(float), ctx.stream()>>>(
+                (const float *) a->data, (const float *) b->data, (float *) add->data, (float *) mul_tensor->data,
+                (int) ncols, eps, (const float *) w->data, (block_q8_1 *) yq);
+            break;
+    }
+    return true;
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
