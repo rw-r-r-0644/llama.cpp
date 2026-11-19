@@ -354,6 +354,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
+llama_build(test-repack-bench.cpp LINK ggml Threads::Threads)
+llama_build_and_test(test-repack-host.cpp LINK ggml)
 
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
